@@ -1,6 +1,7 @@
 "use client";
 
 import { CSSProperties, MouseEvent, PointerEvent, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 
 type ElementType =
   | "text"
@@ -36,6 +37,7 @@ type SlideElement = {
   fontSize?: number;
   fontWeight?: number;
   textAlign?: "left" | "center" | "right";
+  textAutoSize?: boolean;
   fill: string;
   stroke: string;
   strokeWidth: number;
@@ -401,13 +403,43 @@ const sanitizeRichTextHtml = (html: string) => {
   const allowedTags = new Set(["B", "STRONG", "I", "EM", "BR", "DIV", "P", "SPAN"]);
 
   template.content.querySelectorAll("*").forEach((node) => {
+    const style = node.getAttribute("style") ?? "";
+    const fontSize = style.match(/font-size:\s*(\d+(?:\.\d+)?)px/i)?.[1];
+    const fontWeight = style.match(/font-weight:\s*(\d+)/i)?.[1];
     [...node.attributes].forEach((attribute) => node.removeAttribute(attribute.name));
     if (!allowedTags.has(node.tagName)) {
       node.replaceWith(...node.childNodes);
+      return;
+    }
+
+    if (node.tagName === "SPAN") {
+      const safeStyles = [
+        fontSize ? `font-size: ${clamp(Number(fontSize), 8, 160)}px` : "",
+        fontWeight ? `font-weight: ${clamp(Number(fontWeight), 100, 900)}` : "",
+      ].filter(Boolean);
+      if (safeStyles.length > 0) node.setAttribute("style", safeStyles.join("; "));
     }
   });
 
   return template.innerHTML;
+};
+
+const getRichTextMetrics = (html: string, fallbackFontSize: number, fallbackFontWeight: number) => {
+  if (typeof document === "undefined") return { fontSize: fallbackFontSize, fontWeight: fallbackFontWeight };
+  const template = document.createElement("template");
+  template.innerHTML = html;
+  let fontSize = fallbackFontSize;
+  let fontWeight = fallbackFontWeight;
+
+  template.content.querySelectorAll("[style]").forEach((node) => {
+    const style = (node as HTMLElement).getAttribute("style") ?? "";
+    const nextFontSize = style.match(/font-size:\s*(\d+(?:\.\d+)?)px/i)?.[1];
+    const nextFontWeight = style.match(/font-weight:\s*(\d+)/i)?.[1];
+    if (nextFontSize) fontSize = Math.max(fontSize, Number(nextFontSize));
+    if (nextFontWeight) fontWeight = Math.max(fontWeight, Number(nextFontWeight));
+  });
+
+  return { fontSize, fontWeight };
 };
 
 const getGridColor = (background: string) => {
@@ -611,10 +643,26 @@ const resizeBoundsAnchored = (
   };
 };
 
-const fitTextBox = (
+const getTextAutoBounds = (
   element: Pick<SlideElement, "text" | "fontSize" | "fontWeight">,
+  origin: Pick<Bounds, "x" | "y">,
+): Bounds => {
+  const measured = estimateTextBounds(element.text ?? "", element.fontSize ?? 36, undefined, element.fontWeight ?? 800);
+  const width = Math.max(minTextWidth, measured.width);
+
+  return {
+    x: origin.x,
+    y: origin.y,
+    width: Math.min(width, canvasWidth - origin.x),
+    height: Math.min(measured.height, canvasHeight - origin.y),
+  };
+};
+
+const fitTextBox = (
+  element: Pick<SlideElement, "text" | "fontSize" | "fontWeight" | "textAutoSize">,
   bounds: Bounds,
 ): Bounds => {
+  if (element.textAutoSize) return getTextAutoBounds(element, bounds);
   const width = Math.max(minTextWidth, bounds.width);
   const measured = estimateTextBounds(element.text ?? "", element.fontSize ?? 36, width, element.fontWeight ?? 800);
   const height = Math.max(measured.height, Math.min(bounds.height, canvasHeight - bounds.y));
@@ -754,6 +802,62 @@ const ColorInput = ({ value, onChange, label }: ColorInputProps) => {
     onChange(rgbToHex({ ...rgb, [channel]: clamp(channelValue, 0, 255) }));
   };
 
+  const popover = (
+    <div
+      ref={pickerRef}
+      className="color-popover"
+      style={{ left: position.left, top: position.top }}
+      onPointerDown={(event) => event.stopPropagation()}
+      onClick={(event) => event.stopPropagation()}
+    >
+      <div
+        className="color-area"
+        style={{ backgroundColor: hueColor }}
+        onPointerDown={(event) => {
+          event.currentTarget.setPointerCapture(event.pointerId);
+          updateSaturationValue(event);
+        }}
+        onPointerMove={(event) => {
+          if (event.currentTarget.hasPointerCapture(event.pointerId)) updateSaturationValue(event);
+        }}
+      >
+        <span
+          className="color-area-thumb"
+          style={{ left: `${hsv.saturation * 100}%`, top: `${(1 - hsv.value) * 100}%` }}
+        />
+      </div>
+      <div className="color-slider-row">
+        <span className="color-preview" style={{ background: normalizedValue }} />
+        <div
+          className="hue-slider"
+          onPointerDown={(event) => {
+            event.currentTarget.setPointerCapture(event.pointerId);
+            updateHue(event);
+          }}
+          onPointerMove={(event) => {
+            if (event.currentTarget.hasPointerCapture(event.pointerId)) updateHue(event);
+          }}
+        >
+          <span className="hue-thumb" style={{ left: `${(hsv.hue / 360) * 100}%` }} />
+        </div>
+      </div>
+      <div className="rgb-grid">
+        <div className="rgb-channel">
+          <input aria-label="Red" type="number" min={0} max={255} value={rgb.red} onChange={(event) => updateRgbChannel("red", Number(event.target.value))} />
+          <span>R</span>
+        </div>
+        <div className="rgb-channel">
+          <input aria-label="Green" type="number" min={0} max={255} value={rgb.green} onChange={(event) => updateRgbChannel("green", Number(event.target.value))} />
+          <span>G</span>
+        </div>
+        <div className="rgb-channel">
+          <input aria-label="Blue" type="number" min={0} max={255} value={rgb.blue} onChange={(event) => updateRgbChannel("blue", Number(event.target.value))} />
+          <span>B</span>
+        </div>
+      </div>
+    </div>
+  );
+
   return (
     <div className="color-control">
       <button
@@ -768,55 +872,7 @@ const ColorInput = ({ value, onChange, label }: ColorInputProps) => {
       >
         <span style={{ background: normalizedValue }} />
       </button>
-      {open && (
-        <div ref={pickerRef} className="color-popover" style={{ left: position.left, top: position.top }}>
-          <div
-            className="color-area"
-            style={{ backgroundColor: hueColor }}
-            onPointerDown={(event) => {
-              event.currentTarget.setPointerCapture(event.pointerId);
-              updateSaturationValue(event);
-            }}
-            onPointerMove={(event) => {
-              if (event.currentTarget.hasPointerCapture(event.pointerId)) updateSaturationValue(event);
-            }}
-          >
-            <span
-              className="color-area-thumb"
-              style={{ left: `${hsv.saturation * 100}%`, top: `${(1 - hsv.value) * 100}%` }}
-            />
-          </div>
-          <div className="color-slider-row">
-            <span className="color-preview" style={{ background: normalizedValue }} />
-            <div
-              className="hue-slider"
-              onPointerDown={(event) => {
-                event.currentTarget.setPointerCapture(event.pointerId);
-                updateHue(event);
-              }}
-              onPointerMove={(event) => {
-                if (event.currentTarget.hasPointerCapture(event.pointerId)) updateHue(event);
-              }}
-            >
-              <span className="hue-thumb" style={{ left: `${(hsv.hue / 360) * 100}%` }} />
-            </div>
-          </div>
-          <div className="rgb-grid">
-            <div className="rgb-channel">
-              <input aria-label="Red" type="number" min={0} max={255} value={rgb.red} onChange={(event) => updateRgbChannel("red", Number(event.target.value))} />
-              <span>R</span>
-            </div>
-            <div className="rgb-channel">
-              <input aria-label="Green" type="number" min={0} max={255} value={rgb.green} onChange={(event) => updateRgbChannel("green", Number(event.target.value))} />
-              <span>G</span>
-            </div>
-            <div className="rgb-channel">
-              <input aria-label="Blue" type="number" min={0} max={255} value={rgb.blue} onChange={(event) => updateRgbChannel("blue", Number(event.target.value))} />
-              <span>B</span>
-            </div>
-          </div>
-        </div>
-      )}
+      {open && typeof document !== "undefined" ? createPortal(popover, document.body) : null}
     </div>
   );
 };
@@ -1268,10 +1324,14 @@ export default function Home() {
       const fontWeight = element?.fontWeight ?? 800;
       const nextHtml = sanitizeRichTextHtml(editingTextHtmlDraftRef.current);
       const nextText = htmlToPlainText(nextHtml);
+      const richMetrics = getRichTextMetrics(nextHtml, fontSize, fontWeight);
+      const nextBounds = element?.textAutoSize
+        ? getTextAutoBounds({ text: nextText, fontSize: richMetrics.fontSize, fontWeight: richMetrics.fontWeight }, { x: element.x, y: element.y })
+        : estimateTextBounds(nextText, richMetrics.fontSize, element?.width, richMetrics.fontWeight);
       commitElement(editingTextId, {
         text: nextText,
         textHtml: nextHtml,
-        ...estimateTextBounds(nextText, fontSize, element?.width, fontWeight),
+        ...nextBounds,
       });
     }
     setEditingTextId("");
@@ -1307,6 +1367,41 @@ export default function Home() {
     editingTextHtmlDraftRef.current = sanitizeRichTextHtml(editor.innerHTML);
     editingTextDraftRef.current = editor.innerText.replace(/\n$/, "");
     saveTextSelection();
+  };
+
+  const applyRichTextStyle = (style: Partial<Pick<CSSStyleDeclaration, "fontSize" | "fontWeight">>) => {
+    const editor = editingTextNodeRef.current;
+    const range = savedTextSelectionRef.current;
+    if (!editor || !range || range.collapsed) return;
+
+    editor.focus();
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+
+    const span = document.createElement("span");
+    if (style.fontSize) span.style.fontSize = style.fontSize;
+    if (style.fontWeight) span.style.fontWeight = style.fontWeight;
+    span.append(range.extractContents());
+    range.insertNode(span);
+
+    const nextRange = document.createRange();
+    nextRange.selectNodeContents(span);
+    selection?.removeAllRanges();
+    selection?.addRange(nextRange);
+    savedTextSelectionRef.current = nextRange.cloneRange();
+    editingTextHtmlDraftRef.current = sanitizeRichTextHtml(editor.innerHTML);
+    editingTextDraftRef.current = editor.innerText.replace(/\n$/, "");
+  };
+
+  const applySelectedTextFontDelta = (delta: number) => {
+    const baseSize = selectedElement?.fontSize ?? 36;
+    applyRichTextStyle({ fontSize: `${clamp(baseSize + delta, 8, 160)}px` });
+  };
+
+  const applySelectedTextWeightDelta = (delta: number) => {
+    const baseWeight = selectedElement?.fontWeight ?? 800;
+    applyRichTextStyle({ fontWeight: String(clamp(baseWeight + delta, 100, 900)) });
   };
 
   const focusTextEditor = (node: HTMLDivElement, focusMode: "end" | "select-all") => {
@@ -1425,6 +1520,7 @@ export default function Home() {
       fontSize,
       fontWeight,
       textAlign: type === "text" ? "left" : undefined,
+      textAutoSize: type === "text" ? true : undefined,
       fill: type === "text" ? preferences.fill ?? "#111827" : isBorderOnly ? "transparent" : preferences.fill ?? "#ffffff",
       stroke: preferences.stroke ?? "#111827",
       strokeWidth: type === "text" ? 0 : isLine ? 8 : isBorderOnly ? 4 : 0,
@@ -1907,11 +2003,12 @@ export default function Home() {
             width: Math.round(Math.max(16, startElement.width * scaleX)),
             height: Math.round(Math.max(16, startElement.height * scaleY)),
           };
-          const fittedBounds = startElement.type === "text" ? fitTextBox(element, resizedBounds) : resizedBounds;
+          const fittedBounds = startElement.type === "text" ? fitTextBox({ ...element, textAutoSize: false }, resizedBounds) : resizedBounds;
 
           return {
             ...element,
             ...fittedBounds,
+            textAutoSize: startElement.type === "text" ? false : element.textAutoSize,
           };
         }),
       }), { history: false });
@@ -1932,8 +2029,15 @@ export default function Home() {
       const snapped = snapBounds(rawBounds, [element.id]);
       const nextBounds = snapped.bounds;
       setAlignmentGuides(snapped.guides);
-      const fittedBounds = dragState.startElement.type === "text" ? fitTextBox(element, nextBounds) : nextBounds;
-      commitElement(element.id, fittedBounds, { history: false });
+      const fittedBounds = dragState.startElement.type === "text" ? fitTextBox({ ...element, textAutoSize: false }, nextBounds) : nextBounds;
+      commitElement(
+        element.id,
+        {
+          ...fittedBounds,
+          textAutoSize: dragState.startElement.type === "text" ? false : element.textAutoSize,
+        },
+        { history: false },
+      );
     }
 
     if (dragState.mode === "rotate") {
@@ -2463,6 +2567,7 @@ export default function Home() {
               <div
                 className="selection-box single-selection-box"
                 onPointerDown={(event) => startMove(event, selectedElement)}
+                onContextMenu={(event) => handleElementContextMenu(event, selectedElement)}
                 onDoubleClick={(event) => {
                   event.stopPropagation();
                   if (selectedElement.type === "text") startTextEditing(selectedElement);
@@ -2570,21 +2675,29 @@ export default function Home() {
             <div className="inspector-grid">
               {selectedElement.type === "text" && (
                 <>
-                  <label className="field-label wide">Текст<textarea value={selectedElement.text} onChange={(event) => commitElement(selectedElement.id, { text: event.target.value, textHtml: textToHtml(event.target.value), ...estimateTextBounds(event.target.value, selectedElement.fontSize ?? 36, selectedElement.width, selectedElement.fontWeight ?? 800) })} /></label>
+                  <label className="field-label wide">Текст<textarea value={selectedElement.text} onChange={(event) => commitElement(selectedElement.id, { text: event.target.value, textHtml: textToHtml(event.target.value), ...estimateTextBounds(event.target.value, selectedElement.fontSize ?? 36, selectedElement.textAutoSize ? undefined : selectedElement.width, selectedElement.fontWeight ?? 800) })} /></label>
                   <div className="field-label wide">
                     <span>Фрагмент</span>
                     <div className="text-style-controls">
                       <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => applyRichTextCommand("bold")}>B</button>
                       <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => applyRichTextCommand("italic")}><i>I</i></button>
+                      {editingTextId === selectedElement.id && (
+                        <>
+                          <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => applySelectedTextFontDelta(-4)}>A-</button>
+                          <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => applySelectedTextFontDelta(4)}>A+</button>
+                          <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => applySelectedTextWeightDelta(-100)}>W-</button>
+                          <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => applySelectedTextWeightDelta(100)}>W+</button>
+                        </>
+                      )}
                     </div>
                   </div>
                   <label className="field-label"><span>Размер</span><NumberInput key={`${selectedElement.id}-font-size`} min={8} value={selectedElement.fontSize} onCommit={(value) => {
                     const fontSize = Math.max(8, value);
-                    commitElement(selectedElement.id, { fontSize, ...estimateTextBounds(selectedElement.text ?? "", fontSize, selectedElement.width, selectedElement.fontWeight ?? 800) });
+                    commitElement(selectedElement.id, { fontSize, ...estimateTextBounds(selectedElement.text ?? "", fontSize, selectedElement.textAutoSize ? undefined : selectedElement.width, selectedElement.fontWeight ?? 800) });
                   }} /></label>
                   <label className="field-label"><span>Жирность</span><NumberInput key={`${selectedElement.id}-font-weight`} min={100} max={900} step={50} value={selectedElement.fontWeight ?? 800} onCommit={(value) => {
                     const fontWeight = clamp(value, 100, 900);
-                    commitElement(selectedElement.id, { fontWeight, ...estimateTextBounds(selectedElement.text ?? "", selectedElement.fontSize ?? 36, selectedElement.width, fontWeight) });
+                    commitElement(selectedElement.id, { fontWeight, ...estimateTextBounds(selectedElement.text ?? "", selectedElement.fontSize ?? 36, selectedElement.textAutoSize ? undefined : selectedElement.width, fontWeight) });
                   }} /></label>
                   <label className="field-label compact-field">Цвет<ColorInput label="Цвет текста" value={selectedElement.fill} onChange={(fill) => commitElement(selectedElement.id, { fill })} /></label>
                   <div className="field-label wide">
