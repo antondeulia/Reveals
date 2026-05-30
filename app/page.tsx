@@ -1,8 +1,9 @@
 "use client";
 
-import { CSSProperties, KeyboardEvent as ReactKeyboardEvent, MouseEvent, PointerEvent, useEffect, useRef, useState } from "react";
+import { CSSProperties, DragEvent as ReactDragEvent, KeyboardEvent as ReactKeyboardEvent, MouseEvent, PointerEvent, memo, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import hljs from "highlight.js";
+import * as THREE from "three";
 
 type ElementType =
   | "text"
@@ -12,16 +13,24 @@ type ElementType =
   | "border-circle"
   | "diamond"
   | "triangle"
+  | "cube"
+  | "sphere"
+  | "cylinder"
   | "line"
+  | "dashed-line"
   | "arrow"
   | "dashed-arrow"
   | "double-arrow"
+  | "curved-arrow"
+  | "bend-arrow"
   | "image"
   | "code"
-  | "file-tree";
+  | "file-tree"
+  | "table";
 type RevealAnimation = "none" | "fade" | "fade-out" | "fade-up" | "zoom" | "slide-left";
 type SlideTransition = "none" | "fade" | "slide" | "zoom";
 type ResizeHandle = "n" | "ne" | "e" | "se" | "s" | "sw" | "w" | "nw";
+type TextEditFocusMode = "end" | "select-all" | "pointer";
 
 type SlideElement = {
   id: string;
@@ -31,6 +40,9 @@ type SlideElement = {
   width: number;
   height: number;
   rotation: number;
+  pitch?: number;
+  yaw?: number;
+  roll?: number;
   zIndex: number;
   reveal: number;
   animation: RevealAnimation;
@@ -47,11 +59,14 @@ type SlideElement = {
   radius?: number;
   language?: string;
   groupId?: string;
+  curveStart?: { x: number; y: number };
+  curveEnd?: { x: number; y: number };
+  curveControl?: { x: number; y: number };
 };
 
 type ElementTransformSnapshot = Pick<
   SlideElement,
-  "id" | "type" | "x" | "y" | "width" | "height" | "fontSize" | "fontWeight" | "text" | "textHtml" | "textAutoSize"
+  "id" | "type" | "x" | "y" | "width" | "height" | "rotation" | "fontSize" | "fontWeight" | "text" | "textHtml" | "textAutoSize" | "curveStart" | "curveEnd" | "curveControl"
 >;
 type SingleElementTransformSnapshot = Omit<ElementTransformSnapshot, "id">;
 
@@ -68,6 +83,13 @@ type Project = {
   name: string;
   updatedAt: number;
   slides: Slide[];
+};
+
+type WorkspaceNamespace = {
+  id: string;
+  name: string;
+  updatedAt: number;
+  projects: Project[];
 };
 
 type DragState =
@@ -102,6 +124,21 @@ type DragState =
       mode: "rotate";
       elementId: string;
       pointerId: number;
+      startAngle: number;
+      startRotation: number;
+    }
+  | {
+      mode: "group-rotate";
+      elementIds: string[];
+      pointerId: number;
+      startAngle: number;
+      startBounds: Bounds;
+      startElements: ElementTransformSnapshot[];
+    }
+  | {
+      mode: "curve-control";
+      elementId: string;
+      pointerId: number;
     };
 
 type Bounds = {
@@ -124,12 +161,15 @@ type MarqueeSelectionState = {
   currentY: number;
   baseSelectedIds: string[];
   additive: boolean;
+  clickToggleIds?: string[];
+  excludedIds?: string[];
 };
 
 type PendingPlacement = {
   type: ElementType;
   textPreset?: TextPreset;
   point: { x: number; y: number } | null;
+  startPoint?: { x: number; y: number };
 };
 
 type ContextMenuState = {
@@ -137,7 +177,33 @@ type ContextMenuState = {
   y: number;
   elementId: string;
 } | null;
+type SlideContextMenuState = {
+  x: number;
+  y: number;
+  slideId: string;
+} | null;
+type ProjectContextMenuState = {
+  x: number;
+  y: number;
+  projectId: string;
+} | null;
+type NamespaceContextMenuState = {
+  x: number;
+  y: number;
+  namespaceId: string;
+} | null;
 type ContextSubmenu = "z-index" | "reveal" | "animation" | null;
+type SlideDropIndicator = {
+  slideId: string;
+  placement: "before" | "after";
+} | null;
+type CanvasPanState = {
+  pointerId: number;
+  startX: number;
+  startY: number;
+  scrollLeft: number;
+  scrollTop: number;
+};
 
 type StoredProject = Omit<Project, "slides"> & {
   slides: Array<
@@ -148,47 +214,90 @@ type StoredProject = Omit<Project, "slides"> & {
   >;
 };
 
+type StoredNamespace = Partial<Omit<WorkspaceNamespace, "projects">> & {
+  projects?: StoredProject[];
+};
+
+type StoredWorkspace = {
+  namespaces?: StoredNamespace[];
+  activeNamespaceId?: string;
+};
+
 type RemoteProjectsResponse = {
   configured: boolean;
   projects: StoredProject[] | null;
+  workspace?: StoredWorkspace | null;
   updatedAt: number;
+};
+
+type UserSettings = {
+  showRevealNumbers: boolean;
+  showEditGrid: boolean;
+  showPreviewGrid: boolean;
 };
 
 const canvasWidth = 1280;
 const canvasHeight = 720;
 const storageKey = "reveals-studio-projects-v1";
+const namespaceStorageKey = "reveals-studio-namespaces-v1";
+const defaultNamespaceId = "default";
+const defaultNamespaceName = "Default";
 const projectDbName = "reveals-studio-db";
 const projectDbStoreName = "kv";
 const preferencesKey = "reveals-studio-element-preferences-v1";
+const userSettingsKey = "reveals-studio-user-settings-v1";
 const internalClipboardType = "application/x-reveals-elements";
+const internalSlideClipboardType = "application/x-reveals-slide";
 const gridSize = 16;
 const snapThreshold = 6;
 const revealColors = ["#2f6fed", "#f97316", "#14b8a6", "#f43f5e", "#8b5cf6", "#0f766e", "#111827"];
 const resizeHandles: ResizeHandle[] = ["nw", "n", "ne", "e", "se", "s", "sw", "w"];
-const arrowTypes: ElementType[] = ["arrow", "dashed-arrow", "double-arrow"];
+const arrowTypes: ElementType[] = ["arrow", "dashed-arrow", "double-arrow", "curved-arrow", "bend-arrow"];
 const codeLanguages = ["javascript", "typescript", "tsx", "css", "html", "json", "python", "bash", "cpp", "plaintext"];
+const threeShapeTypes: ElementType[] = ["cube", "sphere", "cylinder"];
+const isThreeShapeType = (type: ElementType) => threeShapeTypes.includes(type);
+const defaultThreeAngles = { pitch: 18, yaw: 28, roll: 0 };
 type TextPreset = "title" | "subtitle" | "body";
 const textPresets: Record<TextPreset, { label: string; text: string; fontSize: number; fontWeight: number }> = {
-  title: { label: "Title", text: "Title", fontSize: 64, fontWeight: 900 },
+  title: { label: "Title", text: "Title", fontSize: 48, fontWeight: 900 },
   subtitle: { label: "Subtitle", text: "Subtitle", fontSize: 42, fontWeight: 750 },
-  body: { label: "Text", text: "Text", fontSize: 28, fontWeight: 450 },
+  body: { label: "Text", text: "Text", fontSize: 24, fontWeight: 450 },
 };
+const textFontSizeOptions = Array.from({ length: (160 - 8) / 2 + 1 }, (_, index) => 8 + index * 2);
+const textFontWeightOptions = [
+  { value: 100, label: "Thin" },
+  { value: 200, label: "Extra light" },
+  { value: 300, label: "Light" },
+  { value: 400, label: "Regular" },
+  { value: 500, label: "Medium" },
+  { value: 600, label: "Semibold" },
+  { value: 700, label: "Bold" },
+  { value: 800, label: "Extra bold" },
+  { value: 900, label: "Black" },
+];
 const toolItems: Array<{ type: ElementType; label: string; icon: string; textPreset?: TextPreset }> = [
   { type: "text", label: "Title", icon: "text-title", textPreset: "title" },
   { type: "text", label: "Subtitle", icon: "text-subtitle", textPreset: "subtitle" },
   { type: "text", label: "Text", icon: "text-body", textPreset: "body" },
-  { type: "code", label: "Код", icon: "code" },
-  { type: "file-tree", label: "Файлы", icon: "file-tree" },
-  { type: "rect", label: "Прямоугольник", icon: "rect" },
-  { type: "border-rect", label: "Рамка", icon: "border-rect" },
-  { type: "circle", label: "Круг", icon: "circle" },
-  { type: "border-circle", label: "Окружность", icon: "border-circle" },
-  { type: "diamond", label: "Ромб", icon: "diamond" },
-  { type: "triangle", label: "Треугольник", icon: "triangle" },
-  { type: "line", label: "Линия", icon: "line" },
-  { type: "arrow", label: "Стрелка", icon: "arrow" },
-  { type: "dashed-arrow", label: "Пунктирная стрелка", icon: "dashed-arrow" },
-  { type: "double-arrow", label: "Двухсторонняя стрелка", icon: "double-arrow" },
+  { type: "code", label: "Code", icon: "code" },
+  { type: "file-tree", label: "Files", icon: "file-tree" },
+  { type: "table", label: "Table", icon: "table" },
+  { type: "rect", label: "Rectangle", icon: "rect" },
+  { type: "border-rect", label: "Frame", icon: "border-rect" },
+  { type: "circle", label: "Circle", icon: "circle" },
+  { type: "border-circle", label: "Ring", icon: "border-circle" },
+  { type: "diamond", label: "Diamond", icon: "diamond" },
+  { type: "triangle", label: "Triangle", icon: "triangle" },
+  { type: "cube", label: "Cube", icon: "cube" },
+  { type: "sphere", label: "Sphere", icon: "sphere" },
+  { type: "cylinder", label: "Cylinder", icon: "cylinder" },
+  { type: "line", label: "Line", icon: "line" },
+  { type: "dashed-line", label: "Dashed line", icon: "dashed-line" },
+  { type: "arrow", label: "Arrow", icon: "arrow" },
+  { type: "dashed-arrow", label: "Dashed arrow", icon: "dashed-arrow" },
+  { type: "double-arrow", label: "Double arrow", icon: "double-arrow" },
+  { type: "curved-arrow", label: "Curved arrow", icon: "curved-arrow" },
+  { type: "bend-arrow", label: "Bend arrow", icon: "bend-arrow" },
 ];
 
 type ElementStylePreferences = Record<
@@ -200,16 +309,23 @@ const defaultElementPreferences = (): ElementStylePreferences => ({
   text: { fill: "#111827", stroke: "#111827" },
   code: { fill: "#282c34", stroke: "#111827" },
   "file-tree": { fill: "#ffffff", stroke: "#111827" },
+  table: { fill: "#ffffff", stroke: "#111827" },
   rect: { fill: "#ffffff", stroke: "#111827" },
   "border-rect": { fill: "transparent", stroke: "#111827" },
   circle: { fill: "#ffffff", stroke: "#111827" },
   "border-circle": { fill: "transparent", stroke: "#111827" },
   diamond: { fill: "#ffffff", stroke: "#111827" },
   triangle: { fill: "#ffffff", stroke: "#111827" },
+  cube: { fill: "#ffffff", stroke: "#111827" },
+  sphere: { fill: "#ffffff", stroke: "#111827" },
+  cylinder: { fill: "#ffffff", stroke: "#111827" },
   line: { fill: "transparent", stroke: "#111827" },
+  "dashed-line": { fill: "transparent", stroke: "#111827" },
   arrow: { fill: "transparent", stroke: "#111827" },
   "dashed-arrow": { fill: "transparent", stroke: "#111827" },
   "double-arrow": { fill: "transparent", stroke: "#111827" },
+  "curved-arrow": { fill: "transparent", stroke: "#111827" },
+  "bend-arrow": { fill: "transparent", stroke: "#111827" },
   image: { fill: "transparent", stroke: "#111827" },
 });
 
@@ -229,12 +345,27 @@ const normalizeElementPreferences = (savedPreferences: Partial<Record<ElementTyp
   return nextPreferences;
 };
 
+const defaultUserSettings = (): UserSettings => ({
+  showRevealNumbers: true,
+  showEditGrid: true,
+  showPreviewGrid: true,
+});
+
+const normalizeUserSettings = (savedSettings: Partial<UserSettings> | null | undefined): UserSettings => {
+  const defaults = defaultUserSettings();
+  return {
+    showRevealNumbers: typeof savedSettings?.showRevealNumbers === "boolean" ? savedSettings.showRevealNumbers : defaults.showRevealNumbers,
+    showEditGrid: typeof savedSettings?.showEditGrid === "boolean" ? savedSettings.showEditGrid : defaults.showEditGrid,
+    showPreviewGrid: typeof savedSettings?.showPreviewGrid === "boolean" ? savedSettings.showPreviewGrid : defaults.showPreviewGrid,
+  };
+};
+
 const makeId = () => {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) return crypto.randomUUID();
   return Math.random().toString(36).slice(2);
 };
 
-const cloneProjects = (projects: Project[]) => structuredClone(projects) as Project[];
+const cloneNamespaces = (namespaces: WorkspaceNamespace[]) => structuredClone(namespaces) as WorkspaceNamespace[];
 const hasLargeEmbeddedMedia = (projects: Project[]) =>
   projects.some((project) =>
     project.slides.some((slide) =>
@@ -242,6 +373,8 @@ const hasLargeEmbeddedMedia = (projects: Project[]) =>
     ),
   );
 const getProjectsUpdatedAt = (projects: Project[]) => Math.max(0, ...projects.map((project) => project.updatedAt));
+const getNamespacesUpdatedAt = (namespaces: WorkspaceNamespace[]) =>
+  Math.max(0, ...namespaces.map((namespace) => Math.max(namespace.updatedAt, getProjectsUpdatedAt(namespace.projects))));
 const mergeProjectsByFreshness = (localProjects: Project[], remoteProjects: Project[]) => {
   const merged = new Map<string, Project>();
   localProjects.forEach((project) => merged.set(project.id, project));
@@ -254,14 +387,52 @@ const mergeProjectsByFreshness = (localProjects: Project[], remoteProjects: Proj
 
   return [...merged.values()].sort((first, second) => second.updatedAt - first.updatedAt);
 };
+const mergeNamespacesByFreshness = (localNamespaces: WorkspaceNamespace[], remoteNamespaces: WorkspaceNamespace[]) => {
+  const merged = new Map<string, WorkspaceNamespace>();
+  localNamespaces.forEach((namespace) => merged.set(namespace.id, namespace));
+  remoteNamespaces.forEach((namespace) => {
+    const localNamespace = merged.get(namespace.id);
+    if (!localNamespace) {
+      merged.set(namespace.id, namespace);
+      return;
+    }
+
+    const remoteUpdatedAt = Math.max(namespace.updatedAt, getProjectsUpdatedAt(namespace.projects));
+    const localUpdatedAt = Math.max(localNamespace.updatedAt, getProjectsUpdatedAt(localNamespace.projects));
+    merged.set(namespace.id, {
+      id: localNamespace.id,
+      name: remoteUpdatedAt > localUpdatedAt ? namespace.name : localNamespace.name,
+      updatedAt: Math.max(localNamespace.updatedAt, namespace.updatedAt),
+      projects: mergeProjectsByFreshness(localNamespace.projects, namespace.projects),
+    });
+  });
+
+  return [...merged.values()].sort((first, second) => second.updatedAt - first.updatedAt);
+};
 const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
 const textPaddingX = 8;
 const textPaddingY = 6;
+const textLineHeight = 1.18;
 const minTextWidth = 32;
 const minTextFontSize = 8;
 const maxTextFontSize = 160;
 const colorPickerWidth = 246;
 const colorPickerHeight = 248;
+const minCanvasZoom = 0.35;
+const maxCanvasZoom = 3;
+const rotationSnapStep = 45;
+const rotationSnapThreshold = 5;
+const formatDegrees = (angle: number) => {
+  const normalized = ((Math.round(angle) % 360) + 360) % 360;
+  return normalized > 180 ? normalized - 360 : normalized;
+};
+const snapRotationAngle = (angle: number) => {
+  const normalized = ((angle % 360) + 360) % 360;
+  const target = Math.round(normalized / rotationSnapStep) * rotationSnapStep;
+  const snapped = target === 360 ? 0 : target;
+  const delta = ((snapped - normalized + 540) % 360) - 180;
+  return Math.abs(delta) <= rotationSnapThreshold ? angle + delta : angle;
+};
 
 type RgbColor = {
   red: number;
@@ -290,27 +461,27 @@ const openProjectDb = () =>
     request.onerror = () => resolve(null);
   });
 
-const readProjectsFromDb = async () => {
+const readValueFromDb = async <T,>(key: string) => {
   const db = await openProjectDb();
   if (!db) return null;
 
-  return new Promise<StoredProject[] | null>((resolve) => {
+  return new Promise<T | null>((resolve) => {
     const transaction = db.transaction(projectDbStoreName, "readonly");
-    const request = transaction.objectStore(projectDbStoreName).get(storageKey);
-    request.onsuccess = () => resolve((request.result as StoredProject[] | undefined) ?? null);
+    const request = transaction.objectStore(projectDbStoreName).get(key);
+    request.onsuccess = () => resolve((request.result as T | undefined) ?? null);
     request.onerror = () => resolve(null);
     transaction.oncomplete = () => db.close();
     transaction.onerror = () => db.close();
   });
 };
 
-const writeProjectsToDb = async (projects: Project[]) => {
+const writeValueToDb = async (key: string, value: unknown) => {
   const db = await openProjectDb();
   if (!db) return;
 
   await new Promise<void>((resolve) => {
     const transaction = db.transaction(projectDbStoreName, "readwrite");
-    transaction.objectStore(projectDbStoreName).put(projects, storageKey);
+    transaction.objectStore(projectDbStoreName).put(value, key);
     transaction.oncomplete = () => {
       db.close();
       resolve();
@@ -322,25 +493,31 @@ const writeProjectsToDb = async (projects: Project[]) => {
   });
 };
 
-const readProjectsFromRemote = async () => {
+const readWorkspaceFromDb = () => readValueFromDb<StoredWorkspace>(namespaceStorageKey);
+const readLegacyProjectsFromDb = () => readValueFromDb<StoredProject[]>(storageKey);
+const writeWorkspaceToDb = (workspace: StoredWorkspace) => writeValueToDb(namespaceStorageKey, workspace);
+
+const readNamespacesFromRemote = async () => {
   try {
     const response = await fetch("/api/projects", { cache: "no-store" });
     if (!response.ok) return null;
     const result = await response.json() as RemoteProjectsResponse;
-    return result.configured && result.projects ? normalizeProjects(result.projects) : null;
+    if (!result.configured) return null;
+    if (result.workspace) return normalizeNamespaces(result.workspace);
+    return result.projects ? normalizeNamespaces(result.projects) : null;
   } catch {
     return null;
   }
 };
 
-const writeProjectsToRemote = async (projects: Project[]) => {
+const writeNamespacesToRemote = async (namespaces: WorkspaceNamespace[], activeNamespaceId: string) => {
   try {
     await fetch("/api/projects", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        projects,
-        updatedAt: getProjectsUpdatedAt(projects),
+        workspace: { namespaces, activeNamespaceId },
+        updatedAt: getNamespacesUpdatedAt(namespaces),
       }),
     });
   } catch {
@@ -405,11 +582,55 @@ const escapeHtml = (value: string) =>
 const textToHtml = (value: string) => escapeHtml(value).replaceAll("\n", "<br>");
 
 const htmlToPlainText = (html: string) => {
-  if (typeof document === "undefined") return html.replace(/<br\s*\/?>/gi, "\n").replace(/<[^>]+>/g, "");
-  const container = document.createElement("div");
-  container.innerHTML = html;
-  return container.innerText;
+  if (typeof document === "undefined") return html.replace(/<br\s*\/?>/gi, "\n").replace(/<\/(?:div|p)>/gi, "\n").replace(/<[^>]+>/g, "");
+  const template = document.createElement("template");
+  template.innerHTML = html;
+  const blockTags = new Set(["DIV", "P"]);
+  let text = "";
+
+  const appendNewline = () => {
+    if (text && !text.endsWith("\n")) text += "\n";
+  };
+
+  const walk = (node: Node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      text += node.textContent ?? "";
+      return;
+    }
+
+    if (!(node instanceof HTMLElement)) {
+      node.childNodes.forEach(walk);
+      return;
+    }
+
+    if (node.tagName === "BR") {
+      text += "\n";
+      return;
+    }
+
+    const isBlock = blockTags.has(node.tagName);
+    if (isBlock) appendNewline();
+    node.childNodes.forEach(walk);
+    if (isBlock) appendNewline();
+  };
+
+  template.content.childNodes.forEach(walk);
+  return text.replaceAll("\u00a0", " ").replace(/\n+$/g, "");
 };
+
+const getTextElementPlainText = (element: Pick<SlideElement, "text" | "textHtml">) =>
+  element.textHtml ? htmlToPlainText(element.textHtml) : element.text ?? "";
+
+const parseRichTextFontSize = (style: string, fallbackFontSize: number) => {
+  const pixelSize = style.match(/font-size:\s*(\d+(?:\.\d+)?)px/i)?.[1];
+  if (pixelSize) return clamp(Number(pixelSize), minTextFontSize, maxTextFontSize);
+  const percentSize = style.match(/font-size:\s*(\d+(?:\.\d+)?)%/i)?.[1];
+  if (percentSize) return clamp(fallbackFontSize * (Number(percentSize) / 100), minTextFontSize, maxTextFontSize);
+  return fallbackFontSize;
+};
+
+const formatRichTextFontSizePercent = (fontSize: number, baseFontSize: number) =>
+  `${Math.round((clamp(fontSize, minTextFontSize, maxTextFontSize) / Math.max(1, baseFontSize)) * 1000) / 10}%`;
 
 const sanitizeRichTextHtml = (html: string) => {
   if (typeof document === "undefined") return textToHtml(htmlToPlainText(html));
@@ -419,7 +640,8 @@ const sanitizeRichTextHtml = (html: string) => {
 
   template.content.querySelectorAll("*").forEach((node) => {
     const style = node.getAttribute("style") ?? "";
-    const fontSize = style.match(/font-size:\s*(\d+(?:\.\d+)?)px/i)?.[1];
+    const pixelFontSize = style.match(/font-size:\s*(\d+(?:\.\d+)?)px/i)?.[1];
+    const percentFontSize = style.match(/font-size:\s*(\d+(?:\.\d+)?)%/i)?.[1];
     const fontWeight = style.match(/font-weight:\s*(\d+)/i)?.[1];
     [...node.attributes].forEach((attribute) => node.removeAttribute(attribute.name));
     if (!allowedTags.has(node.tagName)) {
@@ -429,7 +651,8 @@ const sanitizeRichTextHtml = (html: string) => {
 
     if (node.tagName === "SPAN") {
       const safeStyles = [
-        fontSize ? `font-size: ${clamp(Number(fontSize), minTextFontSize, maxTextFontSize)}px` : "",
+        pixelFontSize ? `font-size: ${clamp(Number(pixelFontSize), minTextFontSize, maxTextFontSize)}px` : "",
+        percentFontSize ? `font-size: ${clamp(Number(percentFontSize), 10, 500)}%` : "",
         fontWeight ? `font-weight: ${clamp(Number(fontWeight), 100, 900)}` : "",
       ].filter(Boolean);
       if (safeStyles.length > 0) node.setAttribute("style", safeStyles.join("; "));
@@ -448,29 +671,12 @@ const getRichTextMetrics = (html: string, fallbackFontSize: number, fallbackFont
 
   template.content.querySelectorAll("[style]").forEach((node) => {
     const style = (node as HTMLElement).getAttribute("style") ?? "";
-    const nextFontSize = style.match(/font-size:\s*(\d+(?:\.\d+)?)px/i)?.[1];
     const nextFontWeight = style.match(/font-weight:\s*(\d+)/i)?.[1];
-    if (nextFontSize) fontSize = Math.max(fontSize, Number(nextFontSize));
+    fontSize = Math.max(fontSize, parseRichTextFontSize(style, fallbackFontSize));
     if (nextFontWeight) fontWeight = Math.max(fontWeight, Number(nextFontWeight));
   });
 
   return { fontSize, fontWeight };
-};
-
-const scaleRichTextHtmlFontSizes = (html: string | undefined, scale: number) => {
-  if (!html || typeof document === "undefined" || !Number.isFinite(scale) || Math.abs(scale - 1) < 0.001) return html;
-  const template = document.createElement("template");
-  template.innerHTML = html;
-
-  template.content.querySelectorAll("[style]").forEach((node) => {
-    const element = node as HTMLElement;
-    const style = element.getAttribute("style") ?? "";
-    const fontSize = style.match(/font-size:\s*(\d+(?:\.\d+)?)px/i)?.[1];
-    if (!fontSize) return;
-    element.style.fontSize = `${clamp(Number(fontSize) * scale, minTextFontSize, maxTextFontSize)}px`;
-  });
-
-  return sanitizeRichTextHtml(template.innerHTML);
 };
 
 const enhanceCodeHighlight = (html: string, language: string) => {
@@ -579,6 +785,54 @@ const getFileTreeRows = (tree: string) =>
       };
     })
     .filter((row) => row.label.length > 0);
+
+const getTableRows = (value: string) =>
+  value
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => line.split(line.includes("\t") ? "\t" : ",").map((cell) => cell.trim()));
+
+const makeCurvedArrowElement = (
+  start: { x: number; y: number },
+  end: { x: number; y: number },
+  zIndex: number,
+  preferences: Partial<Pick<SlideElement, "fill" | "stroke">>,
+): SlideElement => {
+  const minSize = 24;
+  const x = Math.min(start.x, end.x);
+  const y = Math.min(start.y, end.y);
+  const rawWidth = Math.abs(end.x - start.x);
+  const rawHeight = Math.abs(end.y - start.y);
+  const width = Math.max(minSize, rawWidth);
+  const height = Math.max(minSize, rawHeight);
+
+  return {
+    id: makeId(),
+    type: "curved-arrow",
+    x: Math.round(clamp(x, 0, canvasWidth - width)),
+    y: Math.round(clamp(y, 0, canvasHeight - height)),
+    width,
+    height,
+    rotation: 0,
+    zIndex,
+    reveal: 1,
+    animation: "fade",
+    fill: "transparent",
+    stroke: preferences.stroke ?? "#111827",
+    strokeWidth: 5,
+    radius: 16,
+    curveStart: { x: start.x - x, y: start.y - y },
+    curveEnd: { x: end.x - x, y: end.y - y },
+  };
+};
+
+const getDefaultBendArrowPoints = (width: number, height: number, strokeWidth: number) => ({
+  start: { x: strokeWidth / 2, y: height / 2 },
+  control: { x: width / 2, y: height / 2 },
+  end: { x: Math.max(strokeWidth / 2, width - strokeWidth / 2), y: height / 2 },
+});
 
 const getGridColor = (background: string) => {
   const hex = background.trim().replace("#", "");
@@ -725,7 +979,7 @@ const estimateTextBounds = (text: string, fontSize = 36, maxWidth?: number, font
 
   return {
     width: Math.ceil(typeof maxWidth === "number" ? maxWidth : measuredWidth + textPaddingX),
-    height: Math.ceil(lines.length * fontSize * 1.12 + textPaddingY),
+    height: Math.ceil(lines.length * fontSize * textLineHeight + textPaddingY),
   };
 };
 
@@ -750,12 +1004,6 @@ const normalizeBounds = (first: { x: number; y: number }, second: { x: number; y
   width: Math.abs(second.x - first.x),
   height: Math.abs(second.y - first.y),
 });
-
-const boundsIntersect = (first: Bounds, second: Bounds) =>
-  first.x <= second.x + second.width &&
-  first.x + first.width >= second.x &&
-  first.y <= second.y + second.height &&
-  first.y + first.height >= second.y;
 
 const resizeBoundsAnchored = (
   startBounds: Bounds,
@@ -867,35 +1115,6 @@ const getTextAutoBounds = (
   };
 };
 
-const textFitsBounds = (text: string, fontSize: number, fontWeight: number, bounds: Bounds) => {
-  const measured = estimateTextBounds(text, fontSize, bounds.width, fontWeight);
-  return measured.width <= bounds.width + 0.5 && measured.height <= bounds.height + 0.5;
-};
-
-const findTextFontSizeForBounds = (
-  text: string,
-  fontWeight: number,
-  bounds: Bounds,
-  preferredFontSize: number,
-) => {
-  const width = Math.max(minTextWidth, bounds.width);
-  const height = Math.max(textPaddingY + minTextFontSize * 1.12, bounds.height);
-  const fitBounds = { ...bounds, width, height };
-  let low = minTextFontSize;
-  let high = maxTextFontSize;
-
-  for (let index = 0; index < 14; index += 1) {
-    const next = (low + high) / 2;
-    if (textFitsBounds(text, next, fontWeight, fitBounds)) {
-      low = next;
-    } else {
-      high = next;
-    }
-  }
-
-  return clamp(Math.min(preferredFontSize, low), minTextFontSize, maxTextFontSize);
-};
-
 const anchorTextBounds = (bounds: Bounds, fitted: Pick<Bounds, "width" | "height">, handle: ResizeHandle): Bounds => {
   const startRight = bounds.x + bounds.width;
   const startBottom = bounds.y + bounds.height;
@@ -926,31 +1145,7 @@ const fitResizedTextElement = (
   const fontWeight = element.fontWeight ?? startElement.fontWeight ?? 800;
   const startFontSize = startElement.fontSize ?? element.fontSize ?? 36;
   const width = Math.max(minTextWidth, Math.min(bounds.width, canvasWidth - bounds.x));
-
-  if (handle.length === 1) {
-    const measured = estimateTextBounds(text, startFontSize, width, fontWeight);
-    const fitted = anchorTextBounds(
-      bounds,
-      {
-        width,
-        height: Math.max(measured.height, Math.min(bounds.height, canvasHeight - bounds.y)),
-      },
-      handle,
-    );
-
-    return {
-      bounds: fitted,
-      fontSize: Math.round(startFontSize * 10) / 10,
-      textHtml: startElement.textHtml ?? element.textHtml,
-    };
-  }
-
-  const widthScale = Math.max(minTextWidth, bounds.width) / Math.max(minTextWidth, startElement.width);
-  const heightScale = Math.max(1, bounds.height) / Math.max(1, startElement.height);
-  const preferredScale = Math.min(widthScale, heightScale);
-  const preferredFontSize = clamp(startFontSize * preferredScale, minTextFontSize, maxTextFontSize);
-  const fontSize = findTextFontSizeForBounds(text, fontWeight, { ...bounds, width }, preferredFontSize);
-  const measured = estimateTextBounds(text, fontSize, width, fontWeight);
+  const measured = estimateTextBounds(text, startFontSize, width, fontWeight);
   const fitted = anchorTextBounds(
     bounds,
     {
@@ -959,12 +1154,11 @@ const fitResizedTextElement = (
     },
     handle,
   );
-  const htmlScale = fontSize / startFontSize;
 
   return {
     bounds: fitted,
-    fontSize: Math.round(fontSize * 10) / 10,
-    textHtml: scaleRichTextHtmlFontSizes(startElement.textHtml ?? element.textHtml, htmlScale),
+    fontSize: Math.round(startFontSize * 10) / 10,
+    textHtml: startElement.textHtml ?? element.textHtml,
   };
 };
 
@@ -979,6 +1173,148 @@ const getSnapAnchors = (bounds: Bounds) => ({
     { position: bounds.y + bounds.height / 2, offset: bounds.height / 2 },
     { position: bounds.y + bounds.height, offset: bounds.height },
   ],
+});
+
+type ThreeShapeProps = {
+  type: ElementType;
+  fill: string;
+  stroke: string;
+  pitch?: number;
+  yaw?: number;
+  roll?: number;
+};
+
+const createThreeGeometry = (type: ElementType) => {
+  if (type === "sphere") return new THREE.SphereGeometry(0.82, 32, 16);
+  if (type === "cylinder") return new THREE.CylinderGeometry(0.68, 0.68, 1.42, 32, 1);
+  return new THREE.BoxGeometry(1.28, 1.28, 1.28, 1, 1, 1);
+};
+
+const toThreeColor = (value: string, fallback: string) => parseColorValue(value) ?? fallback;
+
+const ThreeShape = memo(function ThreeShape({ type, fill, stroke, pitch, yaw, roll }: ThreeShapeProps) {
+  const mountRef = useRef<HTMLDivElement | null>(null);
+  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
+  const sceneRef = useRef<THREE.Scene | null>(null);
+  const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
+  const groupRef = useRef<THREE.Group | null>(null);
+  const materialRef = useRef<THREE.MeshStandardMaterial | null>(null);
+  const edgeMaterialRef = useRef<THREE.LineBasicMaterial | null>(null);
+  const renderRef = useRef<() => void>(() => {});
+
+  useEffect(() => {
+    const mount = mountRef.current;
+    if (!mount) return;
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(36, 1, 0.1, 100);
+    camera.position.set(0, 0, 4.2);
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: "high-performance" });
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.setClearColor(0x000000, 0);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.domElement.className = "three-shape-canvas";
+    mount.appendChild(renderer.domElement);
+
+    const keyLight = new THREE.DirectionalLight(0xffffff, 3.2);
+    keyLight.position.set(-2.4, 3.2, 4);
+    scene.add(keyLight);
+    const fillLight = new THREE.DirectionalLight(0xffffff, 1.6);
+    fillLight.position.set(3, -2, 2.5);
+    scene.add(fillLight);
+    scene.add(new THREE.AmbientLight(0xffffff, 1.1));
+
+    rendererRef.current = renderer;
+    sceneRef.current = scene;
+    cameraRef.current = camera;
+
+    renderRef.current = () => {
+      const width = Math.max(1, mount.clientWidth);
+      const height = Math.max(1, mount.clientHeight);
+      renderer.setSize(width, height, false);
+      camera.aspect = width / height;
+      camera.updateProjectionMatrix();
+      renderer.render(scene, camera);
+    };
+
+    const observer = new ResizeObserver(() => renderRef.current());
+    observer.observe(mount);
+    renderRef.current();
+
+    return () => {
+      observer.disconnect();
+      if (groupRef.current) {
+        scene.remove(groupRef.current);
+        groupRef.current.traverse((object) => {
+          const renderable = object as THREE.Mesh | THREE.LineSegments;
+          renderable.geometry?.dispose();
+        });
+      }
+      materialRef.current?.dispose();
+      edgeMaterialRef.current?.dispose();
+      renderer.dispose();
+      renderer.domElement.remove();
+      rendererRef.current = null;
+      sceneRef.current = null;
+      cameraRef.current = null;
+      groupRef.current = null;
+      materialRef.current = null;
+      edgeMaterialRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    const scene = sceneRef.current;
+    if (!scene) return;
+    if (groupRef.current) {
+      scene.remove(groupRef.current);
+      groupRef.current.traverse((object) => {
+        const renderable = object as THREE.Mesh | THREE.LineSegments;
+        renderable.geometry?.dispose();
+      });
+      materialRef.current?.dispose();
+      edgeMaterialRef.current?.dispose();
+    }
+
+    const material = new THREE.MeshStandardMaterial({
+      color: toThreeColor(fill, "#ffffff"),
+      roughness: 0.58,
+      metalness: 0.03,
+      transparent: fill === "transparent",
+      opacity: fill === "transparent" ? 0.08 : 1,
+      side: THREE.DoubleSide,
+    });
+    const edgeMaterial = new THREE.LineBasicMaterial({
+      color: toThreeColor(stroke, "#111827"),
+      transparent: true,
+      opacity: 0.92,
+    });
+    const geometry = createThreeGeometry(type);
+    const mesh = new THREE.Mesh(geometry, material);
+    const edges = new THREE.LineSegments(new THREE.EdgesGeometry(geometry, type === "sphere" ? 14 : 1), edgeMaterial);
+    const group = new THREE.Group();
+    group.add(mesh, edges);
+    scene.add(group);
+
+    groupRef.current = group;
+    materialRef.current = material;
+    edgeMaterialRef.current = edgeMaterial;
+    renderRef.current();
+  }, [fill, stroke, type]);
+
+  useEffect(() => {
+    const group = groupRef.current;
+    if (!group) return;
+    group.rotation.set(
+      THREE.MathUtils.degToRad(pitch ?? defaultThreeAngles.pitch),
+      THREE.MathUtils.degToRad(yaw ?? defaultThreeAngles.yaw),
+      THREE.MathUtils.degToRad(roll ?? defaultThreeAngles.roll),
+      "XYZ",
+    );
+    renderRef.current();
+  }, [pitch, roll, yaw]);
+
+  return <div className="three-shape" ref={mountRef} aria-hidden="true" />;
 });
 
 type NumberInputProps = {
@@ -1021,6 +1357,65 @@ const NumberInput = ({ value, min, max, step, onCommit }: NumberInputProps) => {
         onCommit(nextValue);
       }}
     />
+  );
+};
+
+type TextFontSizeControlProps = {
+  value?: number;
+  onCommit: (value: number) => void;
+};
+
+const TextFontSizeControl = ({ value, onCommit }: TextFontSizeControlProps) => {
+  const normalizedValue = clamp(Math.round(value ?? 36), minTextFontSize, maxTextFontSize);
+  const options = [...new Set([...textFontSizeOptions, normalizedValue])].sort((first, second) => first - second);
+  const commit = (nextValue: number) => onCommit(clamp(Math.round(nextValue), minTextFontSize, maxTextFontSize));
+
+  return (
+    <div className="text-size-control">
+      <select value={normalizedValue} onChange={(event) => commit(Number(event.target.value))} aria-label="Text size">
+        {options.map((option) => (
+          <option key={option} value={option}>
+            {option}px
+          </option>
+        ))}
+      </select>
+      <div className="text-size-steppers" aria-label="Fine tune text size">
+        <button type="button" title="Decrease size by 1" aria-label="Decrease size by 1" onClick={() => commit(normalizedValue - 1)}>
+          -
+        </button>
+        <button type="button" title="Increase size by 1" aria-label="Increase size by 1" onClick={() => commit(normalizedValue + 1)}>
+          +
+        </button>
+      </div>
+    </div>
+  );
+};
+
+type TextFontWeightControlProps = {
+  value?: number;
+  onCommit: (value: number) => void;
+};
+
+const TextFontWeightControl = ({ value, onCommit }: TextFontWeightControlProps) => {
+  const normalizedValue = clamp(Math.round(value ?? 800), 100, 900);
+  const hasNamedValue = textFontWeightOptions.some((option) => option.value === normalizedValue);
+  const options = hasNamedValue
+    ? textFontWeightOptions
+    : [...textFontWeightOptions, { value: normalizedValue, label: `Custom ${normalizedValue}` }].sort((first, second) => first.value - second.value);
+
+  return (
+    <select
+      className="text-weight-select"
+      value={normalizedValue}
+      onChange={(event) => onCommit(clamp(Number(event.target.value), 100, 900))}
+      aria-label="Text weight"
+    >
+      {options.map((option) => (
+        <option key={option.value} value={option.value}>
+          {option.label}
+        </option>
+      ))}
+    </select>
   );
 };
 
@@ -1220,15 +1615,18 @@ const normalizeProjects = (projects: StoredProject[]): Project[] =>
       ...slide,
       transition: slide.transition ?? "fade",
       elements: slide.elements.map((element, index) => ({
-        fill: element.type === "text" ? "#111827" : element.type === "code" ? "#282c34" : element.type === "file-tree" ? "#ffffff" : "#ffffff",
+        fill: element.type === "text" ? "#111827" : element.type === "code" ? "#282c34" : element.type === "file-tree" || element.type === "table" ? "#ffffff" : "#ffffff",
         stroke: "#111827",
-        strokeWidth: ["border-rect", "border-circle"].includes(element.type) ? 4 : element.type === "arrow" || element.type === "line" ? 8 : element.type === "code" ? 1 : 0,
+        strokeWidth: ["border-rect", "border-circle"].includes(element.type) ? 4 : element.type === "arrow" || element.type === "line" || element.type === "dashed-line" ? 8 : element.type === "code" ? 1 : 0,
         reveal: 1,
         rotation: 0,
+        pitch: isThreeShapeType(element.type) ? defaultThreeAngles.pitch : undefined,
+        yaw: isThreeShapeType(element.type) ? defaultThreeAngles.yaw : undefined,
+        roll: isThreeShapeType(element.type) ? defaultThreeAngles.roll : undefined,
         zIndex: index + 1,
         animation: "fade" as RevealAnimation,
         radius: 16,
-        fontSize: element.type === "code" ? 14 : element.type === "file-tree" ? 18 : 36,
+        fontSize: element.type === "code" ? 14 : element.type === "file-tree" || element.type === "table" ? 18 : 36,
         fontWeight: element.type === "text" ? 800 : undefined,
         textAlign: element.type === "text" ? "left" : undefined,
         language: element.type === "code" ? "javascript" : undefined,
@@ -1238,6 +1636,38 @@ const normalizeProjects = (projects: StoredProject[]): Project[] =>
     })),
   }));
 
+const makeDefaultNamespace = (projects: Project[], updatedAt = getProjectsUpdatedAt(projects)): WorkspaceNamespace => ({
+  id: defaultNamespaceId,
+  name: defaultNamespaceName,
+  updatedAt,
+  projects,
+});
+
+const normalizeNamespaces = (workspace: StoredWorkspace | StoredNamespace[] | StoredProject[] | null | undefined): WorkspaceNamespace[] => {
+  if (!workspace) return [makeDefaultNamespace([starterProject()], Date.now())];
+  if (Array.isArray(workspace)) {
+    const firstItem = workspace[0] as StoredNamespace | StoredProject | undefined;
+    if (firstItem && "projects" in firstItem) {
+      const namespaces = (workspace as StoredNamespace[]).map((namespace, index) => {
+        const projects = normalizeProjects(namespace.projects ?? []);
+        const safeProjects = projects.length > 0 ? projects : [starterProject()];
+        const fallbackName = index === 0 ? defaultNamespaceName : `Namespace ${index + 1}`;
+        return {
+          id: typeof namespace.id === "string" && namespace.id ? namespace.id : makeId(),
+          name: typeof namespace.name === "string" && namespace.name.trim() ? namespace.name : fallbackName,
+          updatedAt: typeof namespace.updatedAt === "number" ? namespace.updatedAt : getProjectsUpdatedAt(safeProjects),
+          projects: safeProjects,
+        };
+      });
+      return namespaces.length > 0 ? namespaces : [makeDefaultNamespace([starterProject()], Date.now())];
+    }
+
+    return [makeDefaultNamespace(normalizeProjects(workspace as StoredProject[]))];
+  }
+
+  return normalizeNamespaces(workspace.namespaces ?? null);
+};
+
 const starterProject = (): Project => ({
   id: makeId(),
   name: "ROS 2 Architecture Pitch",
@@ -1245,7 +1675,7 @@ const starterProject = (): Project => ({
   slides: [
     {
       id: makeId(),
-      title: "Главная схема",
+      title: "Main Diagram",
       background: "#f6f1e7",
       transition: "fade",
       elements: [
@@ -1260,7 +1690,7 @@ const starterProject = (): Project => ({
           zIndex: 1,
           reveal: 1,
           animation: "fade-up",
-          text: "Динамическая презентация",
+          text: "Dynamic presentation",
           fontSize: 54,
           fontWeight: 900,
           textAlign: "left",
@@ -1295,7 +1725,7 @@ const starterProject = (): Project => ({
           zIndex: 3,
           reveal: 1,
           animation: "fade",
-          text: "Слайд",
+          text: "Slide",
           fontSize: 38,
           fontWeight: 800,
           textAlign: "left",
@@ -1340,15 +1770,24 @@ const starterProject = (): Project => ({
 
 export default function Home() {
   const stageRef = useRef<HTMLDivElement | null>(null);
-  const undoStackRef = useRef<Project[][]>([]);
+  const canvasWrapRef = useRef<HTMLDivElement | null>(null);
+  const slideCarouselRef = useRef<HTMLDivElement | null>(null);
+  const undoStackRef = useRef<WorkspaceNamespace[][]>([]);
   const saveProjectsTimerRef = useRef<number | null>(null);
   const editingTextDraftRef = useRef("");
   const editingTextHtmlDraftRef = useRef("");
   const editingTextNodeRef = useRef<HTMLDivElement | null>(null);
-  const editingTextFocusModeRef = useRef<"end" | "select-all">("end");
+  const editingTextFocusModeRef = useRef<TextEditFocusMode>("end");
+  const editingTextPointerRef = useRef<{ x: number; y: number } | null>(null);
+  const lastTextPointerDownRef = useRef<{ id: string; time: number; x: number; y: number } | null>(null);
   const savedTextSelectionRef = useRef<Range | null>(null);
-  const [projects, setProjects] = useState<Project[]>([]);
+  const textStyleControlPointerDownRef = useRef(false);
+  const canvasPanRef = useRef<CanvasPanState | null>(null);
+  const centeredCanvasSlideRef = useRef("");
+  const spacePanRef = useRef(false);
+  const [namespaces, setNamespaces] = useState<WorkspaceNamespace[]>([]);
   const [elementPreferences, setElementPreferences] = useState<ElementStylePreferences>(defaultElementPreferences);
+  const [activeNamespaceId, setActiveNamespaceId] = useState("");
   const [activeProjectId, setActiveProjectId] = useState("");
   const [activeSlideId, setActiveSlideId] = useState("");
   const [selectedElementIds, setSelectedElementIds] = useState<string[]>([]);
@@ -1359,37 +1798,90 @@ export default function Home() {
   const [pendingPlacement, setPendingPlacement] = useState<PendingPlacement | null>(null);
   const [alignmentGuides, setAlignmentGuides] = useState<AlignmentGuide[]>([]);
   const [contextMenu, setContextMenu] = useState<ContextMenuState>(null);
+  const [slideContextMenu, setSlideContextMenu] = useState<SlideContextMenuState>(null);
+  const [projectContextMenu, setProjectContextMenu] = useState<ProjectContextMenuState>(null);
+  const [namespaceContextMenu, setNamespaceContextMenu] = useState<NamespaceContextMenuState>(null);
   const [contextSubmenu, setContextSubmenu] = useState<ContextSubmenu>(null);
   const [clipboardElements, setClipboardElements] = useState<SlideElement[]>([]);
+  const [clipboardSlide, setClipboardSlide] = useState<Slide | null>(null);
+  const [draggedSlideId, setDraggedSlideId] = useState("");
+  const [slideDropIndicator, setSlideDropIndicator] = useState<SlideDropIndicator>(null);
+  const [slideDeleteCandidateId, setSlideDeleteCandidateId] = useState("");
+  const [projectDeleteCandidateId, setProjectDeleteCandidateId] = useState("");
   const [presenting, setPresenting] = useState(false);
   const [presentReveal, setPresentReveal] = useState(1);
+  const [namespaceMenuOpen, setNamespaceMenuOpen] = useState(false);
+  const [projectMenuOpen, setProjectMenuOpen] = useState(false);
   const [loaded, setLoaded] = useState(false);
+  const [canvasZoom, setCanvasZoom] = useState(1);
+  const [canvasBaseWidth, setCanvasBaseWidth] = useState(1180);
+  const [isCanvasPanning, setIsCanvasPanning] = useState(false);
+  const [settingsMenuOpen, setSettingsMenuOpen] = useState(false);
+  const [showRevealNumbers, setShowRevealNumbers] = useState(defaultUserSettings().showRevealNumbers);
+  const [showEditGrid, setShowEditGrid] = useState(defaultUserSettings().showEditGrid);
+  const [showPreviewGrid, setShowPreviewGrid] = useState(defaultUserSettings().showPreviewGrid);
+  const [renamingProjectId, setRenamingProjectId] = useState("");
+  const [renamingProjectName, setRenamingProjectName] = useState("");
+  const [renamingNamespaceId, setRenamingNamespaceId] = useState("");
+  const [renamingNamespaceName, setRenamingNamespaceName] = useState("");
+  const [namespaceDeleteCandidateId, setNamespaceDeleteCandidateId] = useState("");
 
   useEffect(() => {
     let cancelled = false;
 
     const loadProjects = async () => {
-      let nextProjects = [starterProject()];
+      let nextNamespaces = [makeDefaultNamespace([starterProject()], Date.now())];
+      let nextActiveNamespaceId = nextNamespaces[0].id;
       try {
-        const savedFromDb = await readProjectsFromDb();
-        const savedFromStorage = savedFromDb ? null : window.localStorage.getItem(storageKey);
-        const saved = savedFromDb ?? (savedFromStorage ? JSON.parse(savedFromStorage) as StoredProject[] : null);
-        nextProjects = saved ? normalizeProjects(saved) : nextProjects;
-        const remoteProjects = await readProjectsFromRemote();
-        if (remoteProjects) {
-          nextProjects = mergeProjectsByFreshness(nextProjects, remoteProjects);
+        const savedWorkspaceFromDb = await readWorkspaceFromDb();
+        const savedWorkspaceFromStorage = savedWorkspaceFromDb ? null : window.localStorage.getItem(namespaceStorageKey);
+        const savedLegacyFromDb = savedWorkspaceFromDb || savedWorkspaceFromStorage ? null : await readLegacyProjectsFromDb();
+        const savedLegacyFromStorage = savedWorkspaceFromDb || savedWorkspaceFromStorage || savedLegacyFromDb ? null : window.localStorage.getItem(storageKey);
+        const savedWorkspace = savedWorkspaceFromDb ?? (savedWorkspaceFromStorage ? JSON.parse(savedWorkspaceFromStorage) as StoredWorkspace : null);
+        const savedLegacy = savedLegacyFromDb ?? (savedLegacyFromStorage ? JSON.parse(savedLegacyFromStorage) as StoredProject[] : null);
+        if (savedWorkspace) {
+          nextNamespaces = normalizeNamespaces(savedWorkspace);
+          nextActiveNamespaceId =
+            typeof savedWorkspace.activeNamespaceId === "string" && nextNamespaces.some((namespace) => namespace.id === savedWorkspace.activeNamespaceId)
+              ? savedWorkspace.activeNamespaceId
+              : nextNamespaces[0].id;
+        } else if (savedLegacy) {
+          nextNamespaces = normalizeNamespaces(savedLegacy);
+          nextActiveNamespaceId = nextNamespaces[0].id;
+        }
+        const remoteNamespaces = await readNamespacesFromRemote();
+        if (remoteNamespaces) {
+          nextNamespaces = mergeNamespacesByFreshness(nextNamespaces, remoteNamespaces);
+          if (!nextNamespaces.some((namespace) => namespace.id === nextActiveNamespaceId)) {
+            nextActiveNamespaceId = nextNamespaces[0].id;
+          }
         }
         const savedPreferences = window.localStorage.getItem(preferencesKey);
         if (savedPreferences) {
           setElementPreferences(normalizeElementPreferences(JSON.parse(savedPreferences) as Partial<Record<ElementType, Partial<SlideElement>>>));
         }
+        try {
+          const savedSettings = window.localStorage.getItem(userSettingsKey);
+          if (savedSettings) {
+            const nextSettings = normalizeUserSettings(JSON.parse(savedSettings) as Partial<UserSettings>);
+            setShowRevealNumbers(nextSettings.showRevealNumbers);
+            setShowEditGrid(nextSettings.showEditGrid);
+            setShowPreviewGrid(nextSettings.showPreviewGrid);
+          }
+        } catch {
+          window.localStorage.removeItem(userSettingsKey);
+        }
       } catch {
-        nextProjects = [starterProject()];
+        nextNamespaces = [makeDefaultNamespace([starterProject()], Date.now())];
+        nextActiveNamespaceId = nextNamespaces[0].id;
       }
       if (cancelled) return;
-      setProjects(nextProjects);
-      setActiveProjectId(nextProjects[0]?.id ?? "");
-      setActiveSlideId(nextProjects[0]?.slides[0]?.id ?? "");
+      const nextActiveNamespace = nextNamespaces.find((namespace) => namespace.id === nextActiveNamespaceId) ?? nextNamespaces[0];
+      const nextProject = nextActiveNamespace.projects[0];
+      setNamespaces(nextNamespaces);
+      setActiveNamespaceId(nextActiveNamespace.id);
+      setActiveProjectId(nextProject?.id ?? "");
+      setActiveSlideId(nextProject?.slides[0]?.id ?? "");
       setLoaded(true);
     };
 
@@ -1402,15 +1894,17 @@ export default function Home() {
   useEffect(() => {
     if (!loaded) return;
     if (saveProjectsTimerRef.current !== null) window.clearTimeout(saveProjectsTimerRef.current);
-    const projectsToSave = projects;
+    const namespacesToSave = namespaces;
+    const activeNamespaceToSave = activeNamespaceId;
 
     saveProjectsTimerRef.current = window.setTimeout(() => {
-      void writeProjectsToDb(projectsToSave);
-      void writeProjectsToRemote(projectsToSave);
-      if (hasLargeEmbeddedMedia(projectsToSave)) return;
+      const workspace = { namespaces: namespacesToSave, activeNamespaceId: activeNamespaceToSave };
+      void writeWorkspaceToDb(workspace);
+      void writeNamespacesToRemote(namespacesToSave, activeNamespaceToSave);
+      if (namespacesToSave.some((namespace) => hasLargeEmbeddedMedia(namespace.projects))) return;
 
       try {
-        window.localStorage.setItem(storageKey, JSON.stringify(projectsToSave));
+        window.localStorage.setItem(namespaceStorageKey, JSON.stringify(workspace));
       } catch {
         // Large pasted images are persisted in IndexedDB; localStorage is only a small compatibility cache.
       }
@@ -1422,7 +1916,7 @@ export default function Home() {
         saveProjectsTimerRef.current = null;
       }
     };
-  }, [loaded, projects]);
+  }, [activeNamespaceId, loaded, namespaces]);
 
   useEffect(() => {
     if (!loaded) return;
@@ -1441,6 +1935,168 @@ export default function Home() {
     }
   }, [elementPreferences, loaded]);
 
+  useEffect(() => {
+    if (!loaded) return;
+    window.localStorage.setItem(userSettingsKey, JSON.stringify({
+      showRevealNumbers,
+      showEditGrid,
+      showPreviewGrid,
+    }));
+  }, [loaded, showEditGrid, showPreviewGrid, showRevealNumbers]);
+
+  useEffect(() => {
+    if (!activeSlideId) return;
+    slideCarouselRef.current
+      ?.querySelector(`[data-slide-id="${CSS.escape(activeSlideId)}"]`)
+      ?.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
+  }, [activeSlideId]);
+
+  useEffect(() => {
+    if (!loaded) return;
+    const node = canvasWrapRef.current;
+    if (!node) return;
+
+    const handleCanvasWheel = (event: globalThis.WheelEvent) => {
+      event.preventDefault();
+      const rect = node.getBoundingClientRect();
+      const cursorX = event.clientX - rect.left;
+      const cursorY = event.clientY - rect.top;
+      const contentX = node.scrollLeft + cursorX;
+      const contentY = node.scrollTop + cursorY;
+      const panPadding = Math.max(420, Math.round(canvasBaseWidth * 0.45));
+
+      setCanvasZoom((current) => {
+        const next = clamp(current * Math.exp(-event.deltaY * 0.0015), minCanvasZoom, maxCanvasZoom);
+        if (Math.abs(next - current) < 0.001) return current;
+        const zoomRatio = next / current;
+
+        window.requestAnimationFrame(() => {
+          node.scrollLeft = (contentX - panPadding) * zoomRatio + panPadding - cursorX;
+          node.scrollTop = (contentY - panPadding) * zoomRatio + panPadding - cursorY;
+        });
+
+        return Number(next.toFixed(3));
+      });
+    };
+
+    node.addEventListener("wheel", handleCanvasWheel, { passive: false });
+    return () => node.removeEventListener("wheel", handleCanvasWheel);
+  }, [canvasBaseWidth, loaded]);
+
+  useEffect(() => {
+    if (!loaded) return;
+    const node = canvasWrapRef.current;
+    if (!node) return;
+
+    const updateCanvasBaseWidth = () => {
+      const style = window.getComputedStyle(node);
+      const horizontalPadding = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
+      const availableWidth = Math.max(320, node.clientWidth - horizontalPadding);
+      setCanvasBaseWidth(Math.min(1180, availableWidth));
+    };
+
+    updateCanvasBaseWidth();
+    const resizeObserver = new ResizeObserver(updateCanvasBaseWidth);
+    resizeObserver.observe(node);
+    return () => resizeObserver.disconnect();
+  }, [loaded]);
+
+  useEffect(() => {
+    const centerKey = `${activeSlideId}:${canvasBaseWidth}`;
+    if (!loaded || !activeSlideId || centeredCanvasSlideRef.current === centerKey) return;
+    const node = canvasWrapRef.current;
+    if (!node) return;
+
+    centeredCanvasSlideRef.current = centerKey;
+    window.requestAnimationFrame(() => {
+      node.scrollLeft = Math.max(0, (node.scrollWidth - node.clientWidth) / 2);
+      node.scrollTop = Math.max(0, (node.scrollHeight - node.clientHeight) / 2);
+    });
+  }, [activeSlideId, loaded, canvasBaseWidth]);
+
+  useEffect(() => {
+    const targetIsEditing = (target: EventTarget | null) => {
+      const element = target as HTMLElement | null;
+      return Boolean(
+        editingTextId ||
+          element?.tagName === "INPUT" ||
+          element?.tagName === "TEXTAREA" ||
+          element?.tagName === "SELECT" ||
+          element?.isContentEditable,
+      );
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.code !== "Space" || targetIsEditing(event.target)) return;
+      spacePanRef.current = true;
+    };
+    const handleKeyUp = (event: KeyboardEvent) => {
+      if (event.code === "Space") spacePanRef.current = false;
+    };
+    const clearSpacePan = () => {
+      spacePanRef.current = false;
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup", handleKeyUp);
+    window.addEventListener("blur", clearSpacePan);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
+      window.removeEventListener("blur", clearSpacePan);
+    };
+  }, [editingTextId]);
+
+  const startCanvasPan = (event: PointerEvent<HTMLDivElement>) => {
+    const target = event.target as HTMLElement | null;
+    const startedOnStage = Boolean(target?.closest(".stage"));
+    const shouldPan = event.button === 1 || spacePanRef.current || !startedOnStage;
+    if (!shouldPan) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    canvasPanRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      scrollLeft: event.currentTarget.scrollLeft,
+      scrollTop: event.currentTarget.scrollTop,
+    };
+    setIsCanvasPanning(true);
+    setContextMenu(null);
+    setContextSubmenu(null);
+    setSlideContextMenu(null);
+    setNamespaceContextMenu(null);
+  };
+
+  const moveCanvasPan = (event: PointerEvent<HTMLDivElement>) => {
+    const pan = canvasPanRef.current;
+    if (!pan || pan.pointerId !== event.pointerId) return;
+
+    event.preventDefault();
+    event.currentTarget.scrollLeft = pan.scrollLeft - (event.clientX - pan.startX);
+    event.currentTarget.scrollTop = pan.scrollTop - (event.clientY - pan.startY);
+  };
+
+  const stopCanvasPan = (event: PointerEvent<HTMLDivElement>) => {
+    const pan = canvasPanRef.current;
+    if (!pan || pan.pointerId !== event.pointerId) return;
+
+    canvasPanRef.current = null;
+    setIsCanvasPanning(false);
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  };
+
+  const preventMiddleMouseAutoscroll = (event: MouseEvent<HTMLDivElement>) => {
+    if (event.button !== 1) return;
+    event.preventDefault();
+  };
+
+  const activeNamespace = namespaces.find((namespace) => namespace.id === activeNamespaceId) ?? namespaces[0];
+  const projects = activeNamespace?.projects ?? [];
   const activeProject = projects.find((project) => project.id === activeProjectId) ?? projects[0];
   const activeSlide = activeProject?.slides.find((slide) => slide.id === activeSlideId) ?? activeProject?.slides[0];
   const selectedElements = activeSlide?.elements.filter((element) => selectedElementIds.includes(element.id)) ?? [];
@@ -1487,44 +2143,30 @@ export default function Home() {
   const canGroupContextTargets = contextTargets.length > 1;
   const canUngroupContextTargets = contextTargets.some((element) => element.groupId);
 
-  const revealGroups = (() => {
-    const groups = new Map<number, number>();
-    const countedGroups = new Set<string>();
-    activeSlide?.elements.forEach((element) => {
-      if (element.type === "file-tree") {
-        getFileTreeRows(element.text ?? "").forEach((_, index) => {
-          const reveal = element.reveal + index;
-          groups.set(reveal, (groups.get(reveal) ?? 0) + 1);
-        });
-        return;
-      }
-      if (element.groupId) {
-        if (countedGroups.has(element.groupId)) return;
-        countedGroups.add(element.groupId);
-      }
-      groups.set(element.reveal, (groups.get(element.reveal) ?? 0) + 1);
-    });
-    return [...groups.entries()].sort((first, second) => first[0] - second[0]);
-  })();
-
-  const pushUndoSnapshot = (snapshot = projects) => {
-    const historyLimit = hasLargeEmbeddedMedia(snapshot) ? 12 : 80;
-    undoStackRef.current = [...undoStackRef.current.slice(-(historyLimit - 1)), cloneProjects(snapshot)];
+  const pushUndoSnapshot = (snapshot = namespaces) => {
+    const historyLimit = snapshot.some((namespace) => hasLargeEmbeddedMedia(namespace.projects)) ? 12 : 80;
+    undoStackRef.current = [...undoStackRef.current.slice(-(historyLimit - 1)), cloneNamespaces(snapshot)];
   };
 
   const undoLastChange = () => {
-    const previousProjects = undoStackRef.current.at(-1);
-    if (!previousProjects) return;
+    const previousNamespaces = undoStackRef.current.at(-1);
+    if (!previousNamespaces) return;
     undoStackRef.current = undoStackRef.current.slice(0, -1);
     setDragState(null);
     setMarqueeSelection(null);
     setPendingPlacement(null);
     setAlignmentGuides([]);
     setContextMenu(null);
+    setProjectContextMenu(null);
+    setNamespaceContextMenu(null);
+    setSlideContextMenu(null);
     finishTextEditing(false);
-    setProjects(previousProjects);
-    const nextActiveProject = previousProjects.find((project) => project.id === activeProjectId) ?? previousProjects[0];
+    setNamespaces(previousNamespaces);
+    const nextActiveNamespace = previousNamespaces.find((namespace) => namespace.id === activeNamespaceId) ?? previousNamespaces[0];
+    const nextProjects = nextActiveNamespace?.projects ?? [];
+    const nextActiveProject = nextProjects.find((project) => project.id === activeProjectId) ?? nextProjects[0];
     const nextActiveSlide = nextActiveProject?.slides.find((slide) => slide.id === activeSlideId) ?? nextActiveProject?.slides[0];
+    setActiveNamespaceId(nextActiveNamespace?.id ?? "");
     setActiveProjectId(nextActiveProject?.id ?? "");
     setActiveSlideId(nextActiveSlide?.id ?? "");
     setSelectedElementIds((current) =>
@@ -1533,12 +2175,16 @@ export default function Home() {
   };
 
   const commitProjects = (updater: (project: Project) => Project, options: { history?: boolean } = {}) => {
-    if (!activeProject) return;
-    setProjects((current) =>
-      current.map((project) => {
+    if (!activeProject || !activeNamespace) return;
+    setNamespaces((current) =>
+      current.map((namespace) => {
+        if (namespace.id !== activeNamespace.id) return namespace;
+        const nextProjects = namespace.projects.map((project) => {
         if (project.id !== activeProject.id) return project;
         if (options.history !== false) pushUndoSnapshot(current);
         return { ...updater(project), updatedAt: Date.now() };
+        });
+        return { ...namespace, updatedAt: Date.now(), projects: nextProjects };
       }),
     );
   };
@@ -1655,21 +2301,33 @@ export default function Home() {
   const moveContextElementsZ = (direction: "front" | "back" | "forward" | "backward") => {
     if (!activeSlide) return;
     const ids = getContextTargetIds();
-    const maxZ = Math.max(0, ...activeSlide.elements.map((element) => element.zIndex));
-    const minZ = Math.min(0, ...activeSlide.elements.map((element) => element.zIndex));
-    ids.forEach((id) => {
-      const element = activeSlide.elements.find((item) => item.id === id);
-      if (!element) return;
-      const nextZ =
-        direction === "front"
-          ? maxZ + 1
-          : direction === "back"
-            ? minZ - 1
-            : direction === "forward"
-              ? element.zIndex + 1
-              : element.zIndex - 1;
-      commitElement(id, { zIndex: nextZ });
-    });
+    const selectedIds = new Set(ids);
+    const orderedElements = [...activeSlide.elements].sort((first, second) => first.zIndex - second.zIndex || first.id.localeCompare(second.id));
+
+    if (direction === "front") {
+      orderedElements.sort((first, second) => Number(selectedIds.has(first.id)) - Number(selectedIds.has(second.id)));
+    } else if (direction === "back") {
+      orderedElements.sort((first, second) => Number(selectedIds.has(second.id)) - Number(selectedIds.has(first.id)));
+    } else if (direction === "forward") {
+      for (let index = orderedElements.length - 2; index >= 0; index -= 1) {
+        if (!selectedIds.has(orderedElements[index].id) || selectedIds.has(orderedElements[index + 1].id)) continue;
+        [orderedElements[index], orderedElements[index + 1]] = [orderedElements[index + 1], orderedElements[index]];
+      }
+    } else {
+      for (let index = 1; index < orderedElements.length; index += 1) {
+        if (!selectedIds.has(orderedElements[index].id) || selectedIds.has(orderedElements[index - 1].id)) continue;
+        [orderedElements[index], orderedElements[index - 1]] = [orderedElements[index - 1], orderedElements[index]];
+      }
+    }
+
+    const nextZById = new Map(orderedElements.map((element, index) => [element.id, index + 1]));
+    commitSlide((slide) => ({
+      ...slide,
+      elements: slide.elements.map((element) => ({
+        ...element,
+        zIndex: nextZById.get(element.id) ?? Math.max(1, element.zIndex),
+      })),
+    }));
     setContextMenu(null);
   };
 
@@ -1769,12 +2427,17 @@ export default function Home() {
     setContextSubmenu(null);
   };
 
-  const startTextEditing = (element: SlideElement, focusMode: "end" | "select-all" = "end") => {
+  const startTextEditing = (
+    element: SlideElement,
+    focusMode: TextEditFocusMode = "end",
+    pointer?: { x: number; y: number },
+  ) => {
     if (element.type !== "text" && element.type !== "code") return;
     const nextHtml = element.textHtml ?? textToHtml(element.text ?? "");
     setSelectedElementIds([element.id]);
     setEditingTextId(element.id);
     editingTextFocusModeRef.current = focusMode;
+    editingTextPointerRef.current = pointer ?? null;
     editingTextDraftRef.current = element.text ?? "";
     editingTextHtmlDraftRef.current = element.type === "code" ? element.text ?? "" : nextHtml;
     setEditingTextValue(element.type === "code" ? element.text ?? "" : nextHtml);
@@ -1791,6 +2454,7 @@ export default function Home() {
         editingTextDraftRef.current = "";
         editingTextHtmlDraftRef.current = "";
         editingTextFocusModeRef.current = "end";
+        editingTextPointerRef.current = null;
         editingTextNodeRef.current = null;
         savedTextSelectionRef.current = null;
         return;
@@ -1814,6 +2478,7 @@ export default function Home() {
     editingTextDraftRef.current = "";
     editingTextHtmlDraftRef.current = "";
     editingTextFocusModeRef.current = "end";
+    editingTextPointerRef.current = null;
     editingTextNodeRef.current = null;
     savedTextSelectionRef.current = null;
   };
@@ -1826,6 +2491,22 @@ export default function Home() {
     if (editor.contains(range.commonAncestorContainer)) {
       savedTextSelectionRef.current = range.cloneRange();
     }
+  };
+
+  useEffect(() => {
+    if (!editingTextId) return;
+    document.addEventListener("selectionchange", saveTextSelection);
+    return () => document.removeEventListener("selectionchange", saveTextSelection);
+  });
+
+  const runTextStyleControl = (event: PointerEvent<HTMLButtonElement>, action: () => void) => {
+    event.preventDefault();
+    event.stopPropagation();
+    textStyleControlPointerDownRef.current = true;
+    action();
+    requestAnimationFrame(() => {
+      textStyleControlPointerDownRef.current = false;
+    });
   };
 
   const applyRichTextCommand = (command: "bold" | "italic") => {
@@ -1869,25 +2550,110 @@ export default function Home() {
     editingTextDraftRef.current = editor.innerText.replace(/\n$/, "");
   };
 
+  const getSelectedRichTextStyle = () => {
+    const editor = editingTextNodeRef.current;
+    const range = savedTextSelectionRef.current;
+    const baseFontSize = selectedElement?.fontSize ?? 36;
+    const baseFontWeight = selectedElement?.fontWeight ?? 800;
+    if (!editor || !range) return { fontSize: baseFontSize, fontWeight: baseFontWeight };
+
+    const boundaryNode =
+      range.startContainer instanceof Element && range.startContainer.childNodes[range.startOffset]
+        ? range.startContainer.childNodes[range.startOffset]
+        : range.startContainer;
+    let element = boundaryNode instanceof HTMLElement ? boundaryNode : boundaryNode.parentElement;
+
+    while (element && element !== editor) {
+      const style = element.getAttribute("style") ?? "";
+      const fontSize = /font-size\s*:/i.test(style) ? parseRichTextFontSize(style, baseFontSize) : undefined;
+      const fontWeight = style.match(/font-weight:\s*(\d+)/i)?.[1];
+      if (fontSize || fontWeight) {
+        return {
+          fontSize: fontSize ?? baseFontSize,
+          fontWeight: fontWeight ? Number(fontWeight) : baseFontWeight,
+        };
+      }
+      element = element.parentElement;
+    }
+
+    return { fontSize: baseFontSize, fontWeight: baseFontWeight };
+  };
+
   const applySelectedTextFontDelta = (delta: number) => {
     const baseSize = selectedElement?.fontSize ?? 36;
-    applyRichTextStyle({ fontSize: `${clamp(baseSize + delta, 8, 160)}px` });
+    const currentSize = getSelectedRichTextStyle().fontSize;
+    applyRichTextStyle({ fontSize: formatRichTextFontSizePercent(currentSize + delta, baseSize) });
   };
 
   const applySelectedTextWeightDelta = (delta: number) => {
-    const baseWeight = selectedElement?.fontWeight ?? 800;
-    applyRichTextStyle({ fontWeight: String(clamp(baseWeight + delta, 100, 900)) });
+    const currentWeight = getSelectedRichTextStyle().fontWeight;
+    applyRichTextStyle({ fontWeight: String(clamp(currentWeight + delta, 100, 900)) });
   };
 
-  const focusTextEditor = (node: HTMLDivElement, focusMode: "end" | "select-all") => {
+  const focusTextEditor = (node: HTMLDivElement, focusMode: TextEditFocusMode) => {
     node.focus();
     const range = document.createRange();
-    range.selectNodeContents(node);
-    if (focusMode === "end") range.collapse(false);
+    const pointer = editingTextPointerRef.current;
+    if (focusMode === "pointer" && pointer) {
+      const caretPosition = document.caretPositionFromPoint?.(pointer.x, pointer.y);
+      const legacyDocument = document as Document & {
+        caretRangeFromPoint?: (x: number, y: number) => Range | null;
+      };
+      const caretRange = caretPosition
+        ? (() => {
+            const nextRange = document.createRange();
+            nextRange.setStart(caretPosition.offsetNode, caretPosition.offset);
+            nextRange.collapse(true);
+            return nextRange;
+          })()
+        : legacyDocument.caretRangeFromPoint?.(pointer.x, pointer.y);
+      if (caretRange && node.contains(caretRange.commonAncestorContainer)) {
+        range.setStart(caretRange.startContainer, caretRange.startOffset);
+        range.collapse(true);
+      } else {
+        range.selectNodeContents(node);
+        range.collapse(false);
+      }
+    } else {
+      range.selectNodeContents(node);
+      if (focusMode === "end") range.collapse(false);
+    }
     const selection = window.getSelection();
     selection?.removeAllRanges();
     selection?.addRange(range);
     saveTextSelection();
+  };
+
+  const syncTextEditorDraft = (node: HTMLDivElement, type: ElementType) => {
+    if (type === "code") {
+      editingTextDraftRef.current = node.innerText.replace(/\n$/, "");
+      editingTextHtmlDraftRef.current = editingTextDraftRef.current;
+      return;
+    }
+    editingTextDraftRef.current = node.innerText.replace(/\n$/, "");
+    editingTextHtmlDraftRef.current = sanitizeRichTextHtml(node.innerHTML);
+  };
+
+  const bindTextEditorNode = (node: HTMLDivElement | null, element: SlideElement) => {
+    if (!node) return;
+    const isNewEditor = editingTextNodeRef.current !== node;
+    if (!isNewEditor) return;
+
+    editingTextNodeRef.current = node;
+    if (element.type === "code") {
+      if (node.textContent !== editingTextValue) node.textContent = editingTextValue;
+    } else if (node.innerHTML !== editingTextValue) {
+      node.innerHTML = editingTextValue;
+    }
+
+    const focusMode = editingTextFocusModeRef.current;
+    focusTextEditor(node, focusMode);
+    requestAnimationFrame(() => {
+      if (editingTextNodeRef.current !== node) return;
+      focusTextEditor(node, focusMode);
+      editingTextFocusModeRef.current = "end";
+      editingTextPointerRef.current = null;
+    });
   };
 
   const stagePoint = (clientX: number, clientY: number) => {
@@ -1899,12 +2665,27 @@ export default function Home() {
     };
   };
 
+  const elementLocalPoint = (element: SlideElement, point: { x: number; y: number }) => {
+    const centerX = element.x + element.width / 2;
+    const centerY = element.y + element.height / 2;
+    const angle = -(element.rotation ?? 0) * (Math.PI / 180);
+    const dx = point.x - centerX;
+    const dy = point.y - centerY;
+    return {
+      x: clamp(dx * Math.cos(angle) - dy * Math.sin(angle) + element.width / 2, 0, element.width),
+      y: clamp(dx * Math.sin(angle) + dy * Math.cos(angle) + element.height / 2, 0, element.height),
+    };
+  };
+
   const activeSlideMaxReveal = (slide: Slide) => Math.max(1, ...slide.elements.map(getElementMaxReveal));
 
   const showSlide = (slideId: string, reveal = 1) => {
     setActiveSlideId(slideId);
     setSelectedElementIds([]);
     setPresentReveal(reveal);
+    setContextMenu(null);
+    setProjectContextMenu(null);
+    setSlideContextMenu(null);
   };
 
   const presentNext = () => {
@@ -1929,33 +2710,193 @@ export default function Home() {
     if (previousSlide) showSlide(previousSlide.id, activeSlideMaxReveal(previousSlide));
   };
 
-  const addProject = () => {
+  const switchNamespace = (namespaceId: string) => {
+    const namespace = namespaces.find((item) => item.id === namespaceId);
+    if (!namespace) return;
+    const project = namespace.projects[0];
+    setActiveNamespaceId(namespace.id);
+    setActiveProjectId(project?.id ?? "");
+    setActiveSlideId(project?.slides[0]?.id ?? "");
+    setSelectedElementIds([]);
+    setNamespaceMenuOpen(false);
+    setProjectMenuOpen(false);
+    setNamespaceContextMenu(null);
+    setProjectContextMenu(null);
+  };
+
+  const addNamespace = () => {
     const project = starterProject();
-    project.name = `Новый проект ${projects.length + 1}`;
+    const namespace: WorkspaceNamespace = {
+      id: makeId(),
+      name: `Namespace ${namespaces.length + 1}`,
+      updatedAt: project.updatedAt,
+      projects: [project],
+    };
     pushUndoSnapshot();
-    setProjects((current) => [project, ...current]);
+    setNamespaces((current) => [namespace, ...current]);
+    setActiveNamespaceId(namespace.id);
     setActiveProjectId(project.id);
+    setActiveSlideId(project.slides[0]?.id ?? "");
+    setSelectedElementIds([]);
+    setNamespaceMenuOpen(false);
+    setProjectMenuOpen(false);
+    setNamespaceContextMenu(null);
+  };
+
+  const startRenameNamespace = (namespace: WorkspaceNamespace) => {
+    setRenamingNamespaceId(namespace.id);
+    setRenamingNamespaceName(namespace.name);
+    setNamespaceContextMenu(null);
+  };
+
+  const commitNamespaceRename = () => {
+    const nextName = renamingNamespaceName.trim();
+    const namespaceId = renamingNamespaceId;
+    if (!namespaceId) return;
+
+    setRenamingNamespaceId("");
+    setRenamingNamespaceName("");
+    if (!nextName) return;
+
+    setNamespaces((current) => {
+      const target = current.find((namespace) => namespace.id === namespaceId);
+      if (!target || target.name === nextName) return current;
+      pushUndoSnapshot(current);
+      return current.map((namespace) =>
+        namespace.id === namespaceId
+          ? { ...namespace, name: nextName, updatedAt: Date.now() }
+          : namespace,
+      );
+    });
+  };
+
+  const cancelNamespaceRename = () => {
+    setRenamingNamespaceId("");
+    setRenamingNamespaceName("");
+  };
+
+  const requestDeleteNamespace = (namespaceId: string) => {
+    setNamespaceDeleteCandidateId(namespaceId);
+    setNamespaceContextMenu(null);
+  };
+
+  const deleteNamespace = (namespaceId: string) => {
+    pushUndoSnapshot();
+    const remainingNamespaces = namespaces.filter((namespace) => namespace.id !== namespaceId);
+    const fallbackProject = starterProject();
+    const fallbackNamespace = makeDefaultNamespace([fallbackProject], fallbackProject.updatedAt);
+    const nextNamespaces = remainingNamespaces.length > 0 ? remainingNamespaces : [fallbackNamespace];
+    const nextActiveNamespace =
+      activeNamespaceId === namespaceId
+        ? nextNamespaces[0]
+        : nextNamespaces.find((namespace) => namespace.id === activeNamespaceId) ?? nextNamespaces[0];
+    const nextProject = nextActiveNamespace.projects[0];
+
+    setNamespaces(nextNamespaces);
+    setActiveNamespaceId(nextActiveNamespace.id);
+    setActiveProjectId(nextProject?.id ?? "");
+    setActiveSlideId(nextProject?.slides[0]?.id ?? "");
+    setSelectedElementIds([]);
+    setNamespaceMenuOpen(false);
+    setProjectMenuOpen(false);
+    setNamespaceContextMenu(null);
+    setNamespaceDeleteCandidateId("");
+    if (renamingNamespaceId === namespaceId) cancelNamespaceRename();
+  };
+
+  const addProject = () => {
+    if (!activeNamespace) return;
+    const project = starterProject();
+    project.name = `New project ${projects.length + 1}`;
+    pushUndoSnapshot();
+    setNamespaces((current) =>
+      current.map((namespace) =>
+        namespace.id === activeNamespace.id
+          ? { ...namespace, updatedAt: Date.now(), projects: [project, ...namespace.projects] }
+          : namespace,
+      ),
+    );
+    setActiveProjectId(project.id);
+    setProjectMenuOpen(false);
+    setProjectContextMenu(null);
     showSlide(project.slides[0].id);
   };
 
+  const startRenameProject = (project: Project) => {
+    setRenamingProjectId(project.id);
+    setRenamingProjectName(project.name);
+    setProjectContextMenu(null);
+  };
+
+  const commitProjectRename = () => {
+    const nextName = renamingProjectName.trim();
+    const projectId = renamingProjectId;
+    if (!projectId) return;
+
+    setRenamingProjectId("");
+    setRenamingProjectName("");
+    if (!nextName) return;
+
+    setNamespaces((current) => {
+      const targetNamespace = current.find((namespace) => namespace.projects.some((project) => project.id === projectId));
+      const target = targetNamespace?.projects.find((project) => project.id === projectId);
+      if (!targetNamespace || !target || target.name === nextName) return current;
+      pushUndoSnapshot(current);
+      return current.map((namespace) =>
+        namespace.id === targetNamespace.id
+          ? {
+              ...namespace,
+              updatedAt: Date.now(),
+              projects: namespace.projects.map((project) =>
+                project.id === projectId
+                  ? { ...project, name: nextName, updatedAt: Date.now() }
+                  : project,
+              ),
+            }
+          : namespace,
+      );
+    });
+  };
+
+  const cancelProjectRename = () => {
+    setRenamingProjectId("");
+    setRenamingProjectName("");
+  };
+
+  const requestDeleteProject = (projectId: string) => {
+    setProjectDeleteCandidateId(projectId);
+    setProjectContextMenu(null);
+  };
+
   const deleteProject = (projectId: string) => {
+    if (!activeNamespace) return;
     pushUndoSnapshot();
     const remainingProjects = projects.filter((project) => project.id !== projectId);
     const nextProjects = remainingProjects.length > 0 ? remainingProjects : [starterProject()];
     const nextActiveProject =
       activeProjectId === projectId ? nextProjects[0] : nextProjects.find((project) => project.id === activeProjectId) ?? nextProjects[0];
 
-    setProjects(nextProjects);
+    setNamespaces((current) =>
+      current.map((namespace) =>
+        namespace.id === activeNamespace.id
+          ? { ...namespace, updatedAt: Date.now(), projects: nextProjects }
+          : namespace,
+      ),
+    );
     setActiveProjectId(nextActiveProject.id);
     setActiveSlideId(nextActiveProject.slides[0]?.id ?? "");
     setSelectedElementIds([]);
+    setProjectMenuOpen(false);
+    setProjectContextMenu(null);
+    setProjectDeleteCandidateId("");
+    if (renamingProjectId === projectId) cancelProjectRename();
   };
 
   const addSlide = () => {
     if (!activeProject) return;
     const slide: Slide = {
       id: makeId(),
-      title: `Слайд ${activeProject.slides.length + 1}`,
+      title: `Slide ${activeProject.slides.length + 1}`,
       background: "#ffffff",
       transition: "fade",
       elements: [],
@@ -1964,11 +2905,175 @@ export default function Home() {
     showSlide(slide.id);
   };
 
+  const deleteSlide = (slideId: string) => {
+    if (!activeProject || activeProject.slides.length <= 1) return;
+    const slideIndex = activeProject.slides.findIndex((slide) => slide.id === slideId);
+    if (slideIndex < 0) return;
+
+    const remainingSlides = activeProject.slides.filter((slide) => slide.id !== slideId);
+    const nextActiveSlide =
+      activeSlideId === slideId
+        ? remainingSlides[Math.min(slideIndex, remainingSlides.length - 1)]
+        : remainingSlides.find((slide) => slide.id === activeSlideId) ?? remainingSlides[0];
+
+    commitProjects((project) => ({
+      ...project,
+      slides: project.slides.filter((slide) => slide.id !== slideId),
+    }));
+    setActiveSlideId(nextActiveSlide.id);
+    setSelectedElementIds([]);
+    setPresentReveal(1);
+    setDraggedSlideId("");
+    setSlideDropIndicator(null);
+    setSlideContextMenu(null);
+  };
+
+  const requestDeleteSlide = (slideId: string) => {
+    if (!activeProject || activeProject.slides.length <= 1) return;
+    setSlideDeleteCandidateId(slideId);
+    setSlideContextMenu(null);
+  };
+
+  const cloneSlideForInsert = (slide: Slide, title = `${slide.title} copy`): Slide => {
+    const groupIdMap = new Map<string, string>();
+
+    return {
+      ...structuredClone(slide),
+      id: makeId(),
+      title,
+      elements: slide.elements.map((element) => {
+        const nextGroupId = element.groupId
+          ? groupIdMap.get(element.groupId) ?? (() => {
+              const id = makeId();
+              groupIdMap.set(element.groupId, id);
+              return id;
+            })()
+          : undefined;
+
+        return {
+          ...structuredClone(element),
+          id: makeId(),
+          groupId: nextGroupId,
+        };
+      }),
+    };
+  };
+
+  const insertSlideAfterActive = (sourceSlide: Slide) => {
+    if (!activeProject || !activeSlide) return;
+    const sourceTitle = sourceSlide.title.trim() || "Untitled slide";
+    const slide = cloneSlideForInsert(sourceSlide, `${sourceTitle} copy`);
+    const insertIndex = activeProject.slides.findIndex((item) => item.id === activeSlide.id) + 1;
+    commitProjects((project) => {
+      const slides = [...project.slides];
+      slides.splice(Math.max(0, insertIndex), 0, slide);
+      return { ...project, slides };
+    });
+    setSelectedElementIds([]);
+    setClipboardSlide(slide);
+    showSlide(slide.id);
+  };
+
+  const duplicateActiveSlide = () => {
+    if (!activeSlide) return;
+    insertSlideAfterActive(activeSlide);
+  };
+
+  const handleSlideContextMenu = (event: MouseEvent<HTMLElement>, slideId: string) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const rect = event.currentTarget.getBoundingClientRect();
+    const menuWidth = 170;
+    const menuHeight = 48;
+    const gap = 8;
+    const rightX = rect.right + gap;
+    const x = rightX + menuWidth <= window.innerWidth - gap ? rightX : Math.max(gap, rect.left - menuWidth - gap);
+    const y = clamp(rect.top, gap, window.innerHeight - menuHeight - gap);
+
+    showSlide(slideId);
+    setContextSubmenu(null);
+    setContextMenu(null);
+    setSlideContextMenu({ x, y, slideId });
+  };
+
+  const getSlideInsertionIndex = (slides: Slide[], draggedId: string, targetId: string, placement: "before" | "after") => {
+    const draggedIndex = slides.findIndex((slide) => slide.id === draggedId);
+    const targetIndex = slides.findIndex((slide) => slide.id === targetId);
+    if (draggedIndex < 0 || targetIndex < 0 || draggedIndex === targetIndex) return null;
+
+    const rawInsertionIndex = targetIndex + (placement === "after" ? 1 : 0);
+    const insertionIndex = rawInsertionIndex > draggedIndex ? rawInsertionIndex - 1 : rawInsertionIndex;
+    return insertionIndex === draggedIndex ? null : insertionIndex;
+  };
+
+  const moveSlideToPosition = (draggedId: string, targetId: string, placement: "before" | "after") => {
+    if (!activeProject) return;
+    const insertionIndex = getSlideInsertionIndex(activeProject.slides, draggedId, targetId, placement);
+    if (insertionIndex === null) return;
+
+    commitProjects((project) => {
+      const draggedIndex = project.slides.findIndex((slide) => slide.id === draggedId);
+      if (draggedIndex < 0) return project;
+      const slides = [...project.slides];
+      const [draggedSlide] = slides.splice(draggedIndex, 1);
+      slides.splice(insertionIndex, 0, draggedSlide);
+      return { ...project, slides };
+    });
+  };
+
+  const handleSlideDragStart = (event: ReactDragEvent<HTMLElement>, slideId: string) => {
+    setDraggedSlideId(slideId);
+    setSlideDropIndicator(null);
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", slideId);
+  };
+
+  const handleSlideDragOver = (event: ReactDragEvent<HTMLElement>, slideId: string) => {
+    const draggedId = draggedSlideId || event.dataTransfer.getData("text/plain");
+    if (!activeProject || !draggedId || draggedId === slideId) {
+      setSlideDropIndicator(null);
+      return;
+    }
+
+    const rect = event.currentTarget.getBoundingClientRect();
+    const placement = rect.width > rect.height
+      ? event.clientX < rect.left + rect.width / 2 ? "before" : "after"
+      : event.clientY < rect.top + rect.height / 2 ? "before" : "after";
+    if (getSlideInsertionIndex(activeProject.slides, draggedId, slideId, placement) === null) {
+      setSlideDropIndicator(null);
+      return;
+    }
+
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+    setSlideDropIndicator({ slideId, placement });
+  };
+
+  const handleSlideDrop = (event: ReactDragEvent<HTMLElement>, slideId: string) => {
+    event.preventDefault();
+    const draggedId = draggedSlideId || event.dataTransfer.getData("text/plain");
+    const rect = event.currentTarget.getBoundingClientRect();
+    const fallbackPlacement = rect.width > rect.height
+      ? event.clientX < rect.left + rect.width / 2 ? "before" : "after"
+      : event.clientY < rect.top + rect.height / 2 ? "before" : "after";
+    const placement = slideDropIndicator?.slideId === slideId ? slideDropIndicator.placement : fallbackPlacement;
+    setDraggedSlideId("");
+    setSlideDropIndicator(null);
+    moveSlideToPosition(draggedId, slideId, placement);
+  };
+
+  const handleSlideDragEnd = () => {
+    setDraggedSlideId("");
+    setSlideDropIndicator(null);
+  };
+
   const makeElement = (type: ElementType, textPreset?: TextPreset, center?: { x: number; y: number }): SlideElement => {
-    const isLine = type === "line" || arrowTypes.includes(type);
+    const isLine = type === "line" || type === "dashed-line" || arrowTypes.includes(type);
     const isBorderOnly = type === "border-rect" || type === "border-circle" || isLine;
+    const isSolidShape = ["cube", "sphere", "cylinder"].includes(type);
     const isCode = type === "code";
     const isFileTree = type === "file-tree";
+    const isTable = type === "table";
     const offset = ((activeSlide?.elements.length ?? 0) % 6) * 28;
     const preset = textPreset ? textPresets[textPreset] : textPresets.body;
     const preferences = elementPreferences[type];
@@ -1976,14 +3081,17 @@ export default function Home() {
       ? "const hello = 'world';"
       : isFileTree
         ? "src/\n  app/\n    page.tsx\n    globals.css\n  components/\n    Button.tsx\npackage.json"
+        : isTable
+          ? "Metric\tQ1\tQ2\tQ3\nUsers\t12k\t18k\t24k\nRevenue\t$42k\t$58k\t$73k\nGrowth\t14%\t22%\t26%"
         : preset.text;
-    const fontSize = type === "text" ? preset.fontSize : isCode ? 14 : isFileTree ? 18 : 36;
+    const fontSize = type === "text" ? preset.fontSize : isCode ? 14 : isFileTree || isTable ? 18 : 36;
     const fontWeight = type === "text" ? preset.fontWeight : undefined;
     const textBounds = estimateTextBounds(defaultText, fontSize, undefined, fontWeight);
-    const width = type === "text" ? textBounds.width : isCode ? 480 : isFileTree ? 420 : isLine ? 280 : 210;
-    const height = type === "text" ? textBounds.height : isCode ? 240 : isFileTree ? 280 : isLine ? 24 : 140;
+    const width = type === "text" ? textBounds.width : isCode ? 480 : isFileTree ? 420 : isTable ? 560 : isLine ? 280 : isSolidShape ? 170 : 210;
+    const height = type === "text" ? textBounds.height : isCode ? 240 : isFileTree ? 280 : isTable ? 260 : type === "bend-arrow" ? 120 : isLine ? 24 : isSolidShape ? 170 : 140;
     const x = center ? center.x - width / 2 : 180 + offset;
     const y = center ? center.y - height / 2 : 150 + offset;
+    const bendArrowPoints = type === "bend-arrow" ? getDefaultBendArrowPoints(width, height, 8) : null;
 
     return {
       id: makeId(),
@@ -1993,10 +3101,13 @@ export default function Home() {
       width,
       height,
       rotation: 0,
+      pitch: isSolidShape ? defaultThreeAngles.pitch : undefined,
+      yaw: isSolidShape ? defaultThreeAngles.yaw : undefined,
+      roll: isSolidShape ? defaultThreeAngles.roll : undefined,
       zIndex: Math.max(0, ...(activeSlide?.elements.map((element) => element.zIndex) ?? [0])) + 1,
       reveal: 1,
       animation: "fade",
-      text: type === "text" || isCode || isFileTree ? defaultText : undefined,
+      text: type === "text" || isCode || isFileTree || isTable ? defaultText : undefined,
       textHtml: type === "text" ? textToHtml(defaultText) : undefined,
       fontSize,
       fontWeight,
@@ -2005,8 +3116,11 @@ export default function Home() {
       fill: type === "text" ? preferences.fill ?? "#111827" : isBorderOnly ? "transparent" : preferences.fill ?? "#ffffff",
       stroke: preferences.stroke ?? "#111827",
       strokeWidth: type === "text" ? 0 : isCode ? 1 : isLine ? 8 : isBorderOnly ? 4 : 0,
-      radius: isCode || isFileTree ? 8 : 16,
+      radius: isCode || isFileTree || isTable ? 8 : 16,
       language: isCode ? "javascript" : undefined,
+      curveStart: bendArrowPoints?.start,
+      curveEnd: bendArrowPoints?.end,
+      curveControl: bendArrowPoints?.control,
     };
   };
 
@@ -2024,7 +3138,25 @@ export default function Home() {
     insertElement(element);
   };
 
+  const addCurvedArrow = (start: { x: number; y: number }, end: { x: number; y: number }) => {
+    const element = makeCurvedArrowElement(
+      start,
+      end,
+      Math.max(0, ...(activeSlide?.elements.map((item) => item.zIndex) ?? [0])) + 1,
+      elementPreferences["curved-arrow"],
+    );
+    insertElement(element);
+  };
+
   const activatePlacementTool = (type: ElementType, textPreset?: TextPreset) => {
+    if (type === "curved-arrow") {
+      setPendingPlacement({ type, textPreset, point: pendingPlacement?.point ?? null });
+      setSelectedElementIds([]);
+      setContextMenu(null);
+      setContextSubmenu(null);
+      return;
+    }
+
     if (selectionBounds) {
       addElement(type, textPreset, {
         x: selectionBounds.x + selectionBounds.width / 2,
@@ -2042,6 +3174,17 @@ export default function Home() {
 
   const placePendingElement = (point: { x: number; y: number }) => {
     if (!pendingPlacement) return;
+    if (pendingPlacement.type === "curved-arrow") {
+      if (!pendingPlacement.startPoint) {
+        setPendingPlacement({ ...pendingPlacement, startPoint: point, point });
+        return;
+      }
+
+      addCurvedArrow(pendingPlacement.startPoint, point);
+      setPendingPlacement(null);
+      return;
+    }
+
     addElement(pendingPlacement.type, pendingPlacement.textPreset, point);
     setPendingPlacement(null);
   };
@@ -2169,10 +3312,63 @@ export default function Home() {
     point.y >= element.y &&
     point.y <= element.y + element.height;
 
+  const elementUnclampedLocalPoint = (element: SlideElement, point: { x: number; y: number }) => {
+    const centerX = element.x + element.width / 2;
+    const centerY = element.y + element.height / 2;
+    const angle = -(element.rotation ?? 0) * (Math.PI / 180);
+    const dx = point.x - centerX;
+    const dy = point.y - centerY;
+    return {
+      x: dx * Math.cos(angle) - dy * Math.sin(angle) + element.width / 2,
+      y: dx * Math.sin(angle) + dy * Math.cos(angle) + element.height / 2,
+    };
+  };
+
+  const localPointInElementBounds = (element: SlideElement, localPoint: { x: number; y: number }) =>
+    localPoint.x >= 0 &&
+    localPoint.x <= element.width &&
+    localPoint.y >= 0 &&
+    localPoint.y <= element.height;
+
+  const distanceToSegment = (
+    point: { x: number; y: number },
+    start: { x: number; y: number },
+    end: { x: number; y: number },
+  ) => {
+    const dx = end.x - start.x;
+    const dy = end.y - start.y;
+    const lengthSquared = dx * dx + dy * dy;
+    if (lengthSquared === 0) return Math.hypot(point.x - start.x, point.y - start.y);
+    const t = clamp(((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared, 0, 1);
+    return Math.hypot(point.x - (start.x + dx * t), point.y - (start.y + dy * t));
+  };
+
+  const distanceToQuadraticCurve = (
+    point: { x: number; y: number },
+    start: { x: number; y: number },
+    control: { x: number; y: number },
+    end: { x: number; y: number },
+  ) => {
+    let best = Number.POSITIVE_INFINITY;
+    let previous = start;
+    for (let index = 1; index <= 28; index += 1) {
+      const t = index / 28;
+      const inv = 1 - t;
+      const current = {
+        x: inv * inv * start.x + 2 * inv * t * control.x + t * t * end.x,
+        y: inv * inv * start.y + 2 * inv * t * control.y + t * t * end.y,
+      };
+      best = Math.min(best, distanceToSegment(point, previous, current));
+      previous = current;
+    }
+    return best;
+  };
+
   const shouldPassThroughElement = (element: SlideElement, point: { x: number; y: number }) => {
-    if (!elementContainsPoint(element, point)) return false;
-    const localX = point.x - element.x;
-    const localY = point.y - element.y;
+    const localPoint = elementUnclampedLocalPoint(element, point);
+    if (!localPointInElementBounds(element, localPoint)) return true;
+    const localX = localPoint.x;
+    const localY = localPoint.y;
     const hitPadding = Math.max(8, element.strokeWidth + 5);
 
     if (element.type === "border-rect") {
@@ -2194,6 +3390,71 @@ export default function Home() {
       return distance < 1 - ringWidth;
     }
 
+    if (element.type === "diamond") {
+      const normalizedX = Math.abs(localX - element.width / 2) / Math.max(1, element.width / 2);
+      const normalizedY = Math.abs(localY - element.height / 2) / Math.max(1, element.height / 2);
+      return normalizedX + normalizedY > 1;
+    }
+
+    if (element.type === "triangle") {
+      const top = { x: element.width / 2, y: 0 };
+      const left = { x: 0, y: element.height };
+      const right = { x: element.width, y: element.height };
+      const sign = (first: typeof top, second: typeof top, third: typeof top) =>
+        (first.x - third.x) * (second.y - third.y) - (second.x - third.x) * (first.y - third.y);
+      const d1 = sign(localPoint, top, left);
+      const d2 = sign(localPoint, left, right);
+      const d3 = sign(localPoint, right, top);
+      return (d1 < 0 || d2 < 0 || d3 < 0) && (d1 > 0 || d2 > 0 || d3 > 0);
+    }
+
+    if (element.type === "line" || element.type === "dashed-line") {
+      const y = Math.max(element.strokeWidth / 2, element.height / 2);
+      const start = { x: element.strokeWidth / 2, y };
+      const end = { x: Math.max(element.strokeWidth / 2, element.width - element.strokeWidth / 2), y };
+      return distanceToSegment(localPoint, start, end) > hitPadding;
+    }
+
+    if (element.type === "arrow" || element.type === "dashed-arrow" || element.type === "double-arrow") {
+      const strokeWidth = Math.max(1, element.strokeWidth);
+      const arrowHeadLength = Math.min(Math.max(strokeWidth * 3.1, 14), Math.max(8, element.width * 0.35));
+      const arrowHeadHalfHeight = Math.min(Math.max(strokeWidth * 1.9, 9), Math.max(5, element.height * 0.48));
+      const centerY = Math.max(strokeWidth / 2, element.height / 2);
+      const lineStartX = element.type === "double-arrow" ? arrowHeadLength : strokeWidth / 2;
+      const lineEndX = Math.max(lineStartX + 1, element.width - arrowHeadLength);
+      const onLine = distanceToSegment(localPoint, { x: lineStartX, y: centerY }, { x: lineEndX, y: centerY }) <= hitPadding;
+      const inEndHead =
+        localX >= element.width - arrowHeadLength - hitPadding &&
+        localX <= element.width + hitPadding &&
+        Math.abs(localY - centerY) <= arrowHeadHalfHeight + hitPadding;
+      const inStartHead =
+        element.type === "double-arrow" &&
+        localX >= -hitPadding &&
+        localX <= arrowHeadLength + hitPadding &&
+        Math.abs(localY - centerY) <= arrowHeadHalfHeight + hitPadding;
+      return !(onLine || inEndHead || inStartHead);
+    }
+
+    if (element.type === "curved-arrow" || element.type === "bend-arrow") {
+      const strokeWidth = Math.max(1, element.strokeWidth);
+      const start = element.curveStart ?? { x: strokeWidth / 2, y: element.height - strokeWidth / 2 };
+      const end = element.curveEnd ?? { x: Math.max(strokeWidth / 2, element.width - strokeWidth / 2), y: strokeWidth / 2 };
+      const midX = (start.x + end.x) / 2;
+      const midY = (start.y + end.y) / 2;
+      const dx = end.x - start.x;
+      const dy = end.y - start.y;
+      const length = Math.max(1, Math.hypot(dx, dy));
+      const normalX = -dy / length;
+      const normalY = dx / length;
+      const bend = Math.min(Math.max(length * 0.18, 16), 80, Math.max(16, Math.max(element.width, element.height) * 0.72));
+      const control = element.type === "bend-arrow"
+        ? element.curveControl ?? { x: midX + normalX * bend, y: midY + normalY * bend }
+        : { x: midX + normalX * bend, y: midY + normalY * bend };
+      const onCurve = distanceToQuadraticCurve(localPoint, start, control, end) <= hitPadding;
+      const inHead = Math.hypot(localX - end.x, localY - end.y) <= Math.max(hitPadding * 1.6, strokeWidth * 3);
+      return !(onCurve || inHead);
+    }
+
     return false;
   };
 
@@ -2202,11 +3463,21 @@ export default function Home() {
       .filter((item) => !excludedIds.includes(item.id) && elementContainsPoint(item, point) && !shouldPassThroughElement(item, point))
       .sort((first, second) => second.zIndex - first.zIndex || second.reveal - first.reveal)[0];
 
-  const selectElementsInBounds = (bounds: Bounds, baseSelectedIds: string[] = []) => {
+  const selectElementsInBounds = (bounds: Bounds, baseSelectedIds: string[] = [], excludedIds: string[] = []) => {
     const baseIds = new Set(baseSelectedIds);
     const matchedIds =
       activeSlide?.elements
-        .filter((element) => boundsIntersect(bounds, element))
+        .filter((element) => {
+          if (excludedIds.includes(element.id)) return false;
+          const center = {
+            x: element.x + element.width / 2,
+            y: element.y + element.height / 2,
+          };
+          return center.x >= bounds.x &&
+            center.x <= bounds.x + bounds.width &&
+            center.y >= bounds.y &&
+            center.y <= bounds.y + bounds.height;
+        })
         .map((element) => element.id) ?? [];
 
     setSelectedElementIds(expandElementIds([...baseIds, ...matchedIds.filter((id) => !baseIds.has(id))]));
@@ -2261,7 +3532,7 @@ export default function Home() {
     );
 
     setMarqueeSelection(nextMarquee);
-    selectElementsInBounds(bounds, nextMarquee.baseSelectedIds);
+    selectElementsInBounds(bounds, nextMarquee.baseSelectedIds, nextMarquee.excludedIds);
   };
 
   const stopMarqueeSelection = (event: PointerEvent<HTMLDivElement>) => {
@@ -2272,18 +3543,91 @@ export default function Home() {
     );
 
     if (bounds.width < 4 && bounds.height < 4) {
-      setSelectedElementIds(marqueeSelection.baseSelectedIds);
+      if (marqueeSelection.clickToggleIds?.length) {
+        const selected = new Set(marqueeSelection.baseSelectedIds);
+        const allSelected = marqueeSelection.clickToggleIds.every((id) => selected.has(id));
+        if (allSelected) {
+          marqueeSelection.clickToggleIds.forEach((id) => selected.delete(id));
+        } else {
+          marqueeSelection.clickToggleIds.forEach((id) => selected.add(id));
+        }
+        setSelectedElementIds([...selected]);
+      } else {
+        setSelectedElementIds(marqueeSelection.baseSelectedIds);
+      }
     }
 
-    event.currentTarget.releasePointerCapture(event.pointerId);
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
     setMarqueeSelection(null);
   };
 
   const startMove = (event: PointerEvent<HTMLElement>, element: SlideElement, ignoredIds: string[] = []) => {
     if (editingTextId) return;
     const point = stagePoint(event.clientX, event.clientY);
+    const topElement = findTopElementAtPoint(point, ignoredIds);
+    if (topElement && topElement.id !== element.id) {
+      startMove(event, topElement, [...ignoredIds, element.id]);
+      return;
+    }
+
+    if ((element.type === "text" || element.type === "code") && event.button === 0 && !event.shiftKey && !event.metaKey && !event.ctrlKey) {
+      const now = window.performance.now();
+      const lastTextPointerDown = lastTextPointerDownRef.current;
+      const isSameTextDoubleClick =
+        lastTextPointerDown?.id === element.id &&
+        now - lastTextPointerDown.time < 520 &&
+        Math.hypot(event.clientX - lastTextPointerDown.x, event.clientY - lastTextPointerDown.y) < 10;
+
+      lastTextPointerDownRef.current = {
+        id: element.id,
+        time: now,
+        x: event.clientX,
+        y: event.clientY,
+      };
+
+      if (event.detail >= 2 || isSameTextDoubleClick) {
+        event.preventDefault();
+        event.stopPropagation();
+        setDragState(null);
+        startTextEditing(element, "pointer", { x: event.clientX, y: event.clientY });
+        return;
+      }
+    }
+
+    if (event.ctrlKey && element.groupId && !event.shiftKey && !event.metaKey) {
+      event.stopPropagation();
+      setAlignmentGuides([]);
+      setSelectedElementIds([element.id]);
+      setContextMenu(null);
+      setDragState(null);
+      return;
+    }
+
     const elementGroupIds = expandElementIds([element.id]);
     const elementIsSelected = elementGroupIds.every((id) => selectedElementIds.includes(id));
+    if ((event.shiftKey || event.metaKey) && event.button === 0) {
+      event.stopPropagation();
+      stageRef.current?.setPointerCapture(event.pointerId);
+      setDragState(null);
+      setAlignmentGuides([]);
+      setContextMenu(null);
+      setContextSubmenu(null);
+      setMarqueeSelection({
+        pointerId: event.pointerId,
+        startX: point.x,
+        startY: point.y,
+        currentX: point.x,
+        currentY: point.y,
+        baseSelectedIds: expandElementIds(selectedElementIds),
+        additive: true,
+        clickToggleIds: elementGroupIds,
+        excludedIds: [element.id],
+      });
+      return;
+    }
+
     if (shouldPassThroughElement(element, point) && !elementIsSelected) {
       const nextIgnoredIds = [...ignoredIds, element.id];
       const passthroughTarget = findTopElementAtPoint(point, nextIgnoredIds);
@@ -2300,7 +3644,7 @@ export default function Home() {
 
     event.stopPropagation();
     setAlignmentGuides([]);
-    const isMultiSelect = event.shiftKey || event.metaKey || event.ctrlKey;
+    const isMultiSelect = event.shiftKey || event.metaKey;
     const nextSelectedIds = isMultiSelect
       ? elementIsSelected
         ? selectedElementIds.filter((id) => !elementGroupIds.includes(id))
@@ -2308,13 +3652,16 @@ export default function Home() {
       : elementIsSelected
         ? selectedElementIds
         : elementGroupIds;
-    if (!nextSelectedIds.includes(element.id)) {
+    if (isMultiSelect || !nextSelectedIds.includes(element.id)) {
       setSelectedElementIds(nextSelectedIds);
+      setContextMenu(null);
       setDragState(null);
       return;
     }
 
-    const movingIds = expandElementIds(nextSelectedIds);
+    const movingIds = selectedElementIds.length === 1 && selectedElementIds[0] === element.id
+      ? [element.id]
+      : expandElementIds(nextSelectedIds);
     const movingElements = activeSlide?.elements.filter((item) => movingIds.includes(item.id)) ?? [element];
 
     pushUndoSnapshot();
@@ -2332,7 +3679,15 @@ export default function Home() {
         y: item.y,
         width: item.width,
         height: item.height,
+        rotation: item.rotation,
         fontSize: item.fontSize,
+        fontWeight: item.fontWeight,
+        text: item.text,
+        textHtml: item.textHtml,
+        textAutoSize: item.textAutoSize,
+        curveStart: item.curveStart,
+        curveEnd: item.curveEnd,
+        curveControl: item.curveControl,
       })),
     });
   };
@@ -2341,6 +3696,18 @@ export default function Home() {
     event.stopPropagation();
     if (!selectionBounds || selectedElements.length === 0 || event.button !== 0) return;
     const point = stagePoint(event.clientX, event.clientY);
+    const drillTarget = event.ctrlKey && !event.shiftKey && !event.metaKey
+      ? findTopElementAtPoint(point, [])
+      : null;
+
+    if (drillTarget?.groupId) {
+      setAlignmentGuides([]);
+      setSelectedElementIds([drillTarget.id]);
+      setContextMenu(null);
+      setContextSubmenu(null);
+      setDragState(null);
+      return;
+    }
 
     pushUndoSnapshot();
     setAlignmentGuides([]);
@@ -2359,21 +3726,34 @@ export default function Home() {
         y: item.y,
         width: item.width,
         height: item.height,
+        rotation: item.rotation,
         fontSize: item.fontSize,
+        fontWeight: item.fontWeight,
+        text: item.text,
+        textHtml: item.textHtml,
+        textAutoSize: item.textAutoSize,
+        curveStart: item.curveStart,
+        curveEnd: item.curveEnd,
+        curveControl: item.curveControl,
       })),
     });
   };
 
   const handleElementDoubleClick = (event: MouseEvent<HTMLElement>, element: SlideElement) => {
+    event.preventDefault();
     event.stopPropagation();
     const point = stagePoint(event.clientX, event.clientY);
     if (shouldPassThroughElement(element, point)) {
       const passthroughTarget = findTopElementAtPoint(point, [element.id]);
-      if (passthroughTarget?.type === "text" || passthroughTarget?.type === "code") startTextEditing(passthroughTarget);
+      if (passthroughTarget?.type === "text" || passthroughTarget?.type === "code") {
+        startTextEditing(passthroughTarget, "pointer", { x: event.clientX, y: event.clientY });
+      }
       return;
     }
 
-    if (element.type === "text" || element.type === "code") startTextEditing(element);
+    if (element.type === "text" || element.type === "code") {
+      startTextEditing(element, "pointer", { x: event.clientX, y: event.clientY });
+    }
   };
 
   const handleElementContextMenu = (event: MouseEvent<HTMLElement>, element: SlideElement) => {
@@ -2416,21 +3796,72 @@ export default function Home() {
         y: element.y,
         width: element.width,
         height: element.height,
+        rotation: element.rotation,
         fontSize: element.fontSize,
         fontWeight: element.fontWeight,
         text: element.text,
         textHtml: element.textHtml,
         textAutoSize: element.textAutoSize,
+        curveStart: element.curveStart,
+        curveEnd: element.curveEnd,
+        curveControl: element.curveControl,
       },
     });
   };
 
   const startRotate = (event: PointerEvent<HTMLButtonElement>, element: SlideElement) => {
     event.stopPropagation();
+    const point = stagePoint(event.clientX, event.clientY);
+    const centerX = element.x + element.width / 2;
+    const centerY = element.y + element.height / 2;
+    const startAngle = Math.atan2(point.y - centerY, point.x - centerX) * (180 / Math.PI) - 90;
+
     setAlignmentGuides([]);
     pushUndoSnapshot();
     setSelectedElementIds([element.id]);
-    setDragState({ mode: "rotate", elementId: element.id, pointerId: event.pointerId });
+    setDragState({
+      mode: "rotate",
+      elementId: element.id,
+      pointerId: event.pointerId,
+      startAngle,
+      startRotation: element.rotation,
+    });
+  };
+
+  const startGroupRotate = (event: PointerEvent<HTMLButtonElement>) => {
+    event.stopPropagation();
+    if (!selectionBounds || selectedElements.length < 2) return;
+    const point = stagePoint(event.clientX, event.clientY);
+    const centerX = selectionBounds.x + selectionBounds.width / 2;
+    const centerY = selectionBounds.y + selectionBounds.height / 2;
+    const startAngle = Math.atan2(point.y - centerY, point.x - centerX) * (180 / Math.PI) - 90;
+
+    setAlignmentGuides([]);
+    pushUndoSnapshot();
+    setDragState({
+      mode: "group-rotate",
+      elementIds: selectedElementIds,
+      pointerId: event.pointerId,
+      startAngle,
+      startBounds: selectionBounds,
+      startElements: selectedElements.map((item) => ({
+        id: item.id,
+        type: item.type,
+        x: item.x,
+        y: item.y,
+        width: item.width,
+        height: item.height,
+        rotation: item.rotation,
+        fontSize: item.fontSize,
+        fontWeight: item.fontWeight,
+        text: item.text,
+        textHtml: item.textHtml,
+        textAutoSize: item.textAutoSize,
+        curveStart: item.curveStart,
+        curveEnd: item.curveEnd,
+        curveControl: item.curveControl,
+      })),
+    });
   };
 
   const startGroupResize = (event: PointerEvent<HTMLButtonElement>, handle: ResizeHandle) => {
@@ -2454,18 +3885,47 @@ export default function Home() {
         y: item.y,
         width: item.width,
         height: item.height,
+        rotation: item.rotation,
         fontSize: item.fontSize,
         fontWeight: item.fontWeight,
         text: item.text,
         textHtml: item.textHtml,
         textAutoSize: item.textAutoSize,
+        curveStart: item.curveStart,
+        curveEnd: item.curveEnd,
+        curveControl: item.curveControl,
       })),
+    });
+  };
+
+  const startCurveControlDrag = (event: PointerEvent<HTMLButtonElement>, element: SlideElement) => {
+    event.preventDefault();
+    event.stopPropagation();
+    pushUndoSnapshot();
+    setSelectedElementIds([element.id]);
+    setDragState({
+      mode: "curve-control",
+      elementId: element.id,
+      pointerId: event.pointerId,
     });
   };
 
   const applyDrag = (pointerId: number, clientX: number, clientY: number) => {
     if (!dragState || pointerId !== dragState.pointerId) return;
     const point = stagePoint(clientX, clientY);
+
+    if (dragState.mode === "curve-control") {
+      const element = activeSlide?.elements.find((item) => item.id === dragState.elementId);
+      if (!element) return;
+      commitElement(
+        element.id,
+        {
+          curveControl: elementLocalPoint(element, point),
+        },
+        { history: false },
+      );
+      return;
+    }
 
     if (dragState.mode === "move") {
       const deltaX = point.x - dragState.startX;
@@ -2516,6 +3976,17 @@ export default function Home() {
             width: Math.round(Math.max(16, startElement.width * scaleX)),
             height: Math.round(Math.max(16, startElement.height * scaleY)),
           };
+          const resizedCurve = {
+            curveStart: startElement.curveStart
+              ? { x: startElement.curveStart.x * scaleX, y: startElement.curveStart.y * scaleY }
+              : undefined,
+            curveEnd: startElement.curveEnd
+              ? { x: startElement.curveEnd.x * scaleX, y: startElement.curveEnd.y * scaleY }
+              : undefined,
+            curveControl: startElement.curveControl
+              ? { x: startElement.curveControl.x * scaleX, y: startElement.curveControl.y * scaleY }
+              : undefined,
+          };
           if (startElement.type === "text") {
             const fittedText = fitResizedTextElement(element, startElement, resizedBounds, dragState.handle);
 
@@ -2531,6 +4002,7 @@ export default function Home() {
           return {
             ...element,
             ...resizedBounds,
+            ...(startElement.type === "bend-arrow" ? resizedCurve : {}),
           };
         }),
       }), { history: false });
@@ -2545,7 +4017,7 @@ export default function Home() {
         { x: dragState.startX, y: dragState.startY },
         dragState.handle,
         element.rotation,
-        arrowTypes.includes(dragState.startElement.type) || dragState.startElement.type === "line"
+        ["line", "dashed-line", "arrow", "dashed-arrow", "double-arrow"].includes(dragState.startElement.type)
           ? { height: 2 }
           : undefined,
       );
@@ -2571,6 +4043,28 @@ export default function Home() {
         element.id,
         {
           ...nextBounds,
+          ...(dragState.startElement.type === "bend-arrow"
+            ? {
+                curveStart: dragState.startElement.curveStart
+                  ? {
+                      x: dragState.startElement.curveStart.x * (nextBounds.width / Math.max(1, dragState.startElement.width)),
+                      y: dragState.startElement.curveStart.y * (nextBounds.height / Math.max(1, dragState.startElement.height)),
+                    }
+                  : undefined,
+                curveEnd: dragState.startElement.curveEnd
+                  ? {
+                      x: dragState.startElement.curveEnd.x * (nextBounds.width / Math.max(1, dragState.startElement.width)),
+                      y: dragState.startElement.curveEnd.y * (nextBounds.height / Math.max(1, dragState.startElement.height)),
+                    }
+                  : undefined,
+                curveControl: dragState.startElement.curveControl
+                  ? {
+                      x: dragState.startElement.curveControl.x * (nextBounds.width / Math.max(1, dragState.startElement.width)),
+                      y: dragState.startElement.curveControl.y * (nextBounds.height / Math.max(1, dragState.startElement.height)),
+                    }
+                  : undefined,
+              }
+            : {}),
         },
         { history: false },
       );
@@ -2581,9 +4075,47 @@ export default function Home() {
       if (!element) return;
       const centerX = element.x + element.width / 2;
       const centerY = element.y + element.height / 2;
-      const angle = Math.atan2(point.y - centerY, point.x - centerX) * (180 / Math.PI) - 90;
+      const currentAngle = Math.atan2(point.y - centerY, point.x - centerX) * (180 / Math.PI) - 90;
+      const deltaAngle = currentAngle - dragState.startAngle;
+      const nextRotation = snapRotationAngle(dragState.startRotation + deltaAngle);
       setAlignmentGuides([]);
-      commitElement(element.id, { rotation: Math.round(angle) }, { history: false });
+      commitElement(element.id, { rotation: Math.round(nextRotation) }, { history: false });
+    }
+
+    if (dragState.mode === "group-rotate") {
+      const centerX = dragState.startBounds.x + dragState.startBounds.width / 2;
+      const centerY = dragState.startBounds.y + dragState.startBounds.height / 2;
+      const rawAngle = Math.atan2(point.y - centerY, point.x - centerX) * (180 / Math.PI) - 90;
+      const rawDeltaAngle = rawAngle - dragState.startAngle;
+      const firstElementRotation = dragState.startElements[0]?.rotation ?? 0;
+      const snappedFirstRotation = snapRotationAngle(firstElementRotation + rawDeltaAngle);
+      const deltaAngle = snappedFirstRotation - firstElementRotation;
+      const radians = deltaAngle * (Math.PI / 180);
+      const cos = Math.cos(radians);
+      const sin = Math.sin(radians);
+
+      setAlignmentGuides([]);
+      commitSlide((slide) => ({
+        ...slide,
+        elements: slide.elements.map((element) => {
+          const startElement = dragState.startElements.find((item) => item.id === element.id);
+          if (!startElement) return element;
+
+          const elementCenterX = startElement.x + startElement.width / 2;
+          const elementCenterY = startElement.y + startElement.height / 2;
+          const relativeX = elementCenterX - centerX;
+          const relativeY = elementCenterY - centerY;
+          const nextCenterX = centerX + relativeX * cos - relativeY * sin;
+          const nextCenterY = centerY + relativeX * sin + relativeY * cos;
+
+          return {
+            ...element,
+            x: Math.round(clamp(nextCenterX - startElement.width / 2, 0, canvasWidth - startElement.width)),
+            y: Math.round(clamp(nextCenterY - startElement.height / 2, 0, canvasHeight - startElement.height)),
+            rotation: Math.round(startElement.rotation + deltaAngle),
+          };
+        }),
+      }), { history: false });
     }
   };
 
@@ -2627,6 +4159,10 @@ export default function Home() {
       }
 
       if (event.key === "Escape") {
+        if (slideDeleteCandidateId) {
+          setSlideDeleteCandidateId("");
+          return;
+        }
         if (pendingPlacement) {
           setPendingPlacement(null);
           return;
@@ -2641,9 +4177,52 @@ export default function Home() {
         return;
       }
 
+      if (!presenting && selectedElements.length === 0 && (event.key === "Backspace" || event.key === "Delete")) {
+        event.preventDefault();
+        requestDeleteSlide(activeSlide?.id ?? "");
+        return;
+      }
+
       if (!presenting && selectedElements.length > 0 && (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "d") {
         event.preventDefault();
         duplicateElement();
+        return;
+      }
+
+      if (
+        !presenting &&
+        selectedElements.length === 1 &&
+        (selectedElements[0].type === "text" || selectedElements[0].type === "code") &&
+        !event.metaKey &&
+        !event.ctrlKey &&
+        !event.altKey &&
+        event.key.length === 1
+      ) {
+        event.preventDefault();
+        const element = selectedElements[0];
+        const text = event.key;
+        let editedElement: SlideElement;
+        if (element.type === "code") {
+          editedElement = { ...element, text };
+          commitElement(element.id, { text });
+        } else {
+          const patch = {
+            text,
+            textHtml: textToHtml(text),
+            ...estimateTextBounds(text, element.fontSize ?? 36, element.textAutoSize ? undefined : element.width, element.fontWeight ?? 800),
+          };
+          editedElement = { ...element, ...patch };
+          commitElement(element.id, patch);
+        }
+        requestAnimationFrame(() => {
+          startTextEditing(editedElement, "end");
+        });
+        return;
+      }
+
+      if (!presenting && selectedElements.length === 0 && (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "d") {
+        event.preventDefault();
+        duplicateActiveSlide();
         return;
       }
 
@@ -2690,14 +4269,27 @@ export default function Home() {
         target?.tagName === "TEXTAREA" ||
         target?.tagName === "SELECT" ||
         target?.isContentEditable;
-      if (isEditing || presenting || selectedElements.length === 0) return;
+      if (isEditing || presenting) return;
 
-      const elements = getElementsForClipboard();
-      const serializedElements = JSON.stringify(elements);
       event.preventDefault();
-      setClipboardElements(elements);
-      event.clipboardData?.setData(internalClipboardType, serializedElements);
-      event.clipboardData?.setData("text/plain", `REVEALS_ELEMENTS:${serializedElements}`);
+
+      if (selectedElements.length > 0) {
+        const elements = getElementsForClipboard();
+        const serializedElements = JSON.stringify(elements);
+        setClipboardElements(elements);
+        setClipboardSlide(null);
+        event.clipboardData?.setData(internalClipboardType, serializedElements);
+        event.clipboardData?.setData("text/plain", `REVEALS_ELEMENTS:${serializedElements}`);
+        return;
+      }
+
+      if (!activeSlide) return;
+      const slide = structuredClone(activeSlide) as Slide;
+      const serializedSlide = JSON.stringify(slide);
+      setClipboardElements([]);
+      setClipboardSlide(slide);
+      event.clipboardData?.setData(internalSlideClipboardType, serializedSlide);
+      event.clipboardData?.setData("text/plain", `REVEALS_SLIDE:${serializedSlide}`);
     };
 
     window.addEventListener("copy", handleCopy);
@@ -2714,6 +4306,20 @@ export default function Home() {
         target?.tagName === "SELECT" ||
         target?.isContentEditable;
       if (isEditing || presenting) return;
+
+      const slideClipboard =
+        event.clipboardData?.getData(internalSlideClipboardType) ||
+        event.clipboardData?.getData("text/plain")?.replace(/^REVEALS_SLIDE:/, "");
+      if (slideClipboard && slideClipboard !== event.clipboardData?.getData("text/plain")) {
+        try {
+          const slide = JSON.parse(slideClipboard) as Slide;
+          event.preventDefault();
+          insertSlideAfterActive(slide);
+          return;
+        } catch {
+          // Fall back to element/image paste below.
+        }
+      }
 
       const internalClipboard =
         event.clipboardData?.getData(internalClipboardType) ||
@@ -2752,6 +4358,12 @@ export default function Home() {
       if (clipboardElements.length > 0) {
         event.preventDefault();
         pasteElement();
+        return;
+      }
+
+      if (clipboardSlide) {
+        event.preventDefault();
+        insertSlideAfterActive(clipboardSlide);
       }
 
     };
@@ -2783,6 +4395,48 @@ export default function Home() {
     const arrowLineStart = element.type === "double-arrow" ? arrowHeadLength : strokeWidth / 2;
     const arrowLineEnd = Math.max(arrowLineStart + 1, element.width - arrowHeadLength);
     const arrowDash = `${Math.max(8, strokeWidth * 2)} ${Math.max(6, strokeWidth * 1.4)}`;
+    const curveStart = element.curveStart ?? { x: strokeWidth / 2, y: element.height - strokeWidth / 2 };
+    const curveEnd = element.curveEnd ?? { x: Math.max(strokeWidth / 2, element.width - strokeWidth / 2), y: strokeWidth / 2 };
+    const curveMidX = (curveStart.x + curveEnd.x) / 2;
+    const curveMidY = (curveStart.y + curveEnd.y) / 2;
+    const curveDx = curveEnd.x - curveStart.x;
+    const curveDy = curveEnd.y - curveStart.y;
+    const curveLength = Math.max(1, Math.hypot(curveDx, curveDy));
+    const normalX = -curveDy / curveLength;
+    const normalY = curveDx / curveLength;
+    const positiveSpace = Math.min(
+      normalX >= 0 ? element.width - curveMidX : curveMidX,
+      normalY >= 0 ? element.height - curveMidY : curveMidY,
+    );
+    const negativeSpace = Math.min(
+      normalX <= 0 ? element.width - curveMidX : curveMidX,
+      normalY <= 0 ? element.height - curveMidY : curveMidY,
+    );
+    const curveDirection = positiveSpace >= negativeSpace ? 1 : -1;
+    const curveBend = Math.min(Math.max(curveLength * 0.18, 16), 80, Math.max(16, Math.max(positiveSpace, negativeSpace) * 0.72));
+    const autoCurveControl = {
+      x: clamp(curveMidX + normalX * curveBend * curveDirection, 0, element.width),
+      y: clamp(curveMidY + normalY * curveBend * curveDirection, 0, element.height),
+    };
+    const curveControl = element.type === "bend-arrow" ? element.curveControl ?? autoCurveControl : autoCurveControl;
+    const curveControlX = curveControl.x;
+    const curveControlY = curveControl.y;
+    const tangentX = curveEnd.x - curveControlX;
+    const tangentY = curveEnd.y - curveControlY;
+    const tangentLength = Math.max(1, Math.hypot(tangentX, tangentY));
+    const unitTangentX = tangentX / tangentLength;
+    const unitTangentY = tangentY / tangentLength;
+    const unitNormalX = -unitTangentY;
+    const unitNormalY = unitTangentX;
+    const curvedHeadLength = Math.min(Math.max(strokeWidth * 2.15, 8), Math.max(7, curveLength * 0.18));
+    const curvedHeadHalfWidth = Math.min(Math.max(strokeWidth * 1.25, 4), Math.max(4, curveLength * 0.08));
+    const curvedHeadBaseX = curveEnd.x - unitTangentX * curvedHeadLength;
+    const curvedHeadBaseY = curveEnd.y - unitTangentY * curvedHeadLength;
+    const curvedHeadPoints = [
+      `${curveEnd.x},${curveEnd.y}`,
+      `${curvedHeadBaseX + unitNormalX * curvedHeadHalfWidth},${curvedHeadBaseY + unitNormalY * curvedHeadHalfWidth}`,
+      `${curvedHeadBaseX - unitNormalX * curvedHeadHalfWidth},${curvedHeadBaseY - unitNormalY * curvedHeadHalfWidth}`,
+    ].join(" ");
 
     return (
       <div
@@ -2804,6 +4458,10 @@ export default function Home() {
               autoFocus
               contentEditable
               suppressContentEditableWarning
+              role="textbox"
+              aria-multiline="true"
+              spellCheck
+              tabIndex={0}
               className="element-text element-text-editor"
               style={{
                 color: element.fill,
@@ -2812,34 +4470,30 @@ export default function Home() {
                 textAlign: element.textAlign ?? "left",
               }}
               onInput={(event) => {
-                editingTextDraftRef.current = event.currentTarget.innerText.replace(/\n$/, "");
-                editingTextHtmlDraftRef.current = sanitizeRichTextHtml(event.currentTarget.innerHTML);
+                syncTextEditorDraft(event.currentTarget, element.type);
                 saveTextSelection();
               }}
+              onCompositionEnd={(event) => {
+                syncTextEditorDraft(event.currentTarget, element.type);
+                saveTextSelection();
+              }}
+              onFocus={saveTextSelection}
               onMouseUp={saveTextSelection}
               onKeyUp={saveTextSelection}
               onPaste={(event) => {
                 event.preventDefault();
                 document.execCommand("insertText", false, event.clipboardData.getData("text/plain"));
               }}
-              onBlur={() => finishTextEditing(true)}
+              onBlur={() => {
+                if (textStyleControlPointerDownRef.current) {
+                  editingTextNodeRef.current?.focus();
+                  return;
+                }
+                finishTextEditing(true);
+              }}
               onPointerDown={(event) => event.stopPropagation()}
               onDoubleClick={(event) => event.stopPropagation()}
-              ref={(node) => {
-                if (!node) return;
-                const isNewEditor = editingTextNodeRef.current !== node;
-                editingTextNodeRef.current = node;
-                if (node.innerHTML !== editingTextValue) node.innerHTML = editingTextValue;
-                const focusMode = editingTextFocusModeRef.current;
-                focusTextEditor(node, focusMode);
-                if (isNewEditor) {
-                  requestAnimationFrame(() => {
-                    if (editingTextNodeRef.current !== node) return;
-                    focusTextEditor(node, focusMode);
-                    editingTextFocusModeRef.current = "end";
-                  });
-                }
-              }}
+              ref={(node) => bindTextEditorNode(node, element)}
               onKeyDown={(event) => {
                 if (event.key === "Escape") {
                   event.preventDefault();
@@ -2878,6 +4532,10 @@ export default function Home() {
               autoFocus
               contentEditable
               suppressContentEditableWarning
+              role="textbox"
+              aria-multiline="true"
+              spellCheck={false}
+              tabIndex={0}
               className="element-code element-code-editor"
               style={{
                 backgroundColor: element.fill,
@@ -2886,9 +4544,13 @@ export default function Home() {
                 borderRadius: element.radius,
               }}
               onInput={(event) => {
-                editingTextDraftRef.current = event.currentTarget.innerText.replace(/\n$/, "");
-                editingTextHtmlDraftRef.current = editingTextDraftRef.current;
+                syncTextEditorDraft(event.currentTarget, element.type);
               }}
+              onCompositionEnd={(event) => {
+                syncTextEditorDraft(event.currentTarget, element.type);
+                saveTextSelection();
+              }}
+              onFocus={saveTextSelection}
               onMouseUp={saveTextSelection}
               onKeyUp={saveTextSelection}
               onPaste={(event) => {
@@ -2898,21 +4560,7 @@ export default function Home() {
               onBlur={() => finishTextEditing(true)}
               onPointerDown={(event) => event.stopPropagation()}
               onDoubleClick={(event) => event.stopPropagation()}
-              ref={(node) => {
-                if (!node) return;
-                const isNewEditor = editingTextNodeRef.current !== node;
-                editingTextNodeRef.current = node;
-                if (node.textContent !== editingTextValue) node.textContent = editingTextValue;
-                const focusMode = editingTextFocusModeRef.current;
-                focusTextEditor(node, focusMode);
-                if (isNewEditor) {
-                  requestAnimationFrame(() => {
-                    if (editingTextNodeRef.current !== node) return;
-                    focusTextEditor(node, focusMode);
-                    editingTextFocusModeRef.current = "end";
-                  });
-                }
-              }}
+              ref={(node) => bindTextEditorNode(node, element)}
               onKeyDown={(event) => {
                 if (event.key === "Escape") {
                   event.preventDefault();
@@ -3004,11 +4652,35 @@ export default function Home() {
             })}
           </div>
         )}
+        {element.type === "table" && (
+          <div
+            className="element-table-panel"
+            style={{
+              backgroundColor: element.fill,
+              color: element.stroke,
+              fontSize: `calc(${(element.fontSize ?? 18) / canvasWidth} * 100cqw)`,
+              borderColor: element.stroke,
+              borderRadius: element.radius,
+            }}
+          >
+            <table>
+              <tbody>
+                {getTableRows(element.text ?? "").map((row, rowIndex) => (
+                  <tr key={`${element.id}-table-row-${rowIndex}`}>
+                    {row.map((cell, cellIndex) => (
+                      <td key={`${element.id}-table-cell-${rowIndex}-${cellIndex}`}>{cell}</td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
         {(element.type === "rect" || element.type === "border-rect") && (
           <div
             className="shape rect"
             style={{
-              background: element.type === "border-rect" ? "transparent" : element.fill,
+              background: element.fill,
               borderColor: element.stroke,
               borderWidth: element.type === "border-rect" ? strokeSize : 0,
               borderRadius: element.radius,
@@ -3019,7 +4691,7 @@ export default function Home() {
           <div
             className="shape circle"
             style={{
-              background: element.type === "border-circle" ? "transparent" : element.fill,
+              background: element.fill,
               borderColor: element.stroke,
               borderWidth: element.type === "border-circle" ? strokeSize : 0,
             }}
@@ -3043,13 +4715,37 @@ export default function Home() {
             }
           />
         )}
+        {isThreeShapeType(element.type) && (
+          <ThreeShape
+            type={element.type}
+            fill={element.fill}
+            stroke={element.stroke}
+            pitch={element.pitch}
+            yaw={element.yaw}
+            roll={element.roll}
+          />
+        )}
         {element.type === "line" && (
           <div
             className="line-shape"
             style={{ color: element.stroke, "--stroke-size": strokeSize } as CSSProperties}
           />
         )}
-        {arrowTypes.includes(element.type) && (
+        {element.type === "dashed-line" && (
+          <svg className="arrow-svg" viewBox={`0 0 ${Math.max(1, element.width)} ${Math.max(1, element.height)}`} preserveAspectRatio="none" aria-hidden="true">
+            <line
+              x1={strokeWidth / 2}
+              y1={Math.max(strokeWidth / 2, element.height / 2)}
+              x2={Math.max(strokeWidth / 2, element.width - strokeWidth / 2)}
+              y2={Math.max(strokeWidth / 2, element.height / 2)}
+              stroke={element.stroke}
+              strokeWidth={strokeWidth}
+              strokeDasharray={`${Math.max(10, strokeWidth * 2.4)} ${Math.max(8, strokeWidth * 1.8)}`}
+              strokeLinecap="round"
+            />
+          </svg>
+        )}
+        {arrowTypes.includes(element.type) && element.type !== "curved-arrow" && element.type !== "bend-arrow" && (
           <svg className="arrow-svg" viewBox={`0 0 ${Math.max(1, element.width)} ${Math.max(1, element.height)}`} preserveAspectRatio="none" aria-hidden="true">
             <line
               x1={arrowLineStart}
@@ -3073,6 +4769,31 @@ export default function Home() {
             />
           </svg>
         )}
+        {(element.type === "curved-arrow" || element.type === "bend-arrow") && (
+          <svg className="arrow-svg" viewBox={`0 0 ${Math.max(1, element.width)} ${Math.max(1, element.height)}`} preserveAspectRatio="none" aria-hidden="true">
+            <path
+              d={`M ${curveStart.x} ${curveStart.y} Q ${curveControlX} ${curveControlY} ${curveEnd.x} ${curveEnd.y}`}
+              fill="none"
+              stroke={element.stroke}
+              strokeLinecap="round"
+              strokeWidth={strokeWidth}
+            />
+            <polygon points={curvedHeadPoints} fill={element.stroke} />
+          </svg>
+        )}
+        {interactive && isSelected && element.type === "bend-arrow" && (
+          <button
+            type="button"
+            className="curve-control-handle"
+            title="Bend arrow"
+            aria-label="Bend arrow"
+            onPointerDown={(event) => startCurveControlDrag(event, element)}
+            style={{
+              left: `${(curveControlX / Math.max(1, element.width)) * 100}%`,
+              top: `${(curveControlY / Math.max(1, element.height)) * 100}%`,
+            }}
+          />
+        )}
         {element.type === "image" && element.src && (
           // eslint-disable-next-line @next/next/no-img-element
           <img className="media-element" src={element.src} alt="" draggable={false} />
@@ -3082,6 +4803,7 @@ export default function Home() {
   };
 
   const renderRevealBadge = (element: SlideElement) => {
+    if (!showRevealNumbers) return null;
     if (presenting) return null;
     if (editingTextId === element.id) return null;
     const groupElements = element.groupId
@@ -3092,12 +4814,13 @@ export default function Home() {
     const badgeBounds = getBounds(groupElements) ?? element;
     const reveal = Math.min(...groupElements.map((item) => item.reveal));
     const revealColor = revealColors[(reveal - 1) % revealColors.length];
-    const offset = element.groupId || element.type === "text" ? -18 : 6;
+    const compactBadge = badgeBounds.width < 72 || badgeBounds.height < 72;
+    const offset = compactBadge ? -12 : element.groupId || element.type === "text" ? -18 : 6;
 
     return (
       <span
         aria-hidden="true"
-        className="reveal-badge stage-reveal-badge"
+        className={`reveal-badge stage-reveal-badge ${compactBadge ? "compact-reveal-badge" : ""}`}
         key={`${element.id}-reveal-badge`}
         style={{
           background: revealColor,
@@ -3110,8 +4833,29 @@ export default function Home() {
     );
   };
 
+  const renderSlidePreview = (slide: Slide) => {
+    const previewReveal = activeSlideMaxReveal(slide);
+
+    return (
+      <div
+        className={`slide-preview-stage ${showPreviewGrid ? "" : "hide-grid"}`}
+        style={
+          {
+            backgroundColor: slide.background,
+            backgroundImage: showPreviewGrid ? undefined : "none",
+            "--grid-color": getGridColor(slide.background),
+          } as CSSProperties
+        }
+      >
+        {sortByReveal(slide.elements)
+          .filter((element) => element.reveal <= previewReveal)
+          .map((element) => renderElement(element, false, previewReveal))}
+      </div>
+    );
+  };
+
   const selectedHasStrokeControls = selectedElement
-    ? ["border-rect", "border-circle", "line", ...arrowTypes].includes(selectedElement.type)
+    ? ["border-rect", "border-circle", "line", "dashed-line", ...arrowTypes].includes(selectedElement.type)
     : false;
   const marqueeBounds = marqueeSelection
     ? normalizeBounds(
@@ -3122,59 +4866,218 @@ export default function Home() {
   const pendingPlacementPreview = pendingPlacement?.point
     ? makeElement(pendingPlacement.type, pendingPlacement.textPreset, pendingPlacement.point)
     : null;
+  const pendingCurvedArrowPreview = pendingPlacement?.type === "curved-arrow" && pendingPlacement.startPoint && pendingPlacement.point
+    ? makeCurvedArrowElement(pendingPlacement.startPoint, pendingPlacement.point, 1, elementPreferences["curved-arrow"])
+    : null;
+  const selectedSupportsOptionalFill = selectedElement ? ["border-rect", "border-circle"].includes(selectedElement.type) : false;
+  const selectedHasFill = selectedElement?.fill !== "transparent";
+  const selectedElementIsSmall = selectedElement ? selectedElement.width < 72 || selectedElement.height < 72 : false;
+  const selectionBoundsIsSmall = selectionBounds ? selectionBounds.width < 72 || selectionBounds.height < 72 : false;
+  const slideDeleteCandidate = activeProject?.slides.find((slide) => slide.id === slideDeleteCandidateId);
+  const projectDeleteCandidate = projects.find((project) => project.id === projectDeleteCandidateId);
+  const namespaceDeleteCandidate = namespaces.find((namespace) => namespace.id === namespaceDeleteCandidateId);
+  const scaledCanvasWidth = Math.round(canvasBaseWidth * canvasZoom);
+  const scaledCanvasHeight = Math.round((canvasBaseWidth * canvasHeight / canvasWidth) * canvasZoom);
+  const canvasPanPadding = Math.max(420, Math.round(canvasBaseWidth * 0.45));
+  const canvasPlaneWidth = scaledCanvasWidth + canvasPanPadding * 2;
+  const canvasPlaneHeight = scaledCanvasHeight + canvasPanPadding * 2;
 
-  if (!loaded || !activeProject || !activeSlide) return <main className="loading-screen">Загрузка редактора...</main>;
+  if (!loaded || !activeNamespace || !activeProject || !activeSlide) {
+    return (
+      <main className="loading-screen" aria-label="Loading Reveal Studio">
+        <div className="loading-mark" aria-hidden="true">
+          <span />
+          <span />
+          <span />
+        </div>
+      </main>
+    );
+  }
 
   return (
-    <main className="studio-shell">
-      <aside className="sidebar">
-        <div className="brand-row">
-          <div>
-            <p className="eyebrow">Reveal Studio</p>
-            <h1>Проекты</h1>
-          </div>
-          <button type="button" className="icon-button" title="Новый проект" onClick={addProject}>
-            +
-          </button>
-        </div>
-
-        <div className="project-list">
-          {projects.map((project) => (
-            <div
-              className={`project-item ${project.id === activeProject.id ? "active" : ""}`}
-              key={project.id}
+    <main className="studio-app" onPointerDown={() => { setSlideContextMenu(null); setProjectContextMenu(null); setNamespaceContextMenu(null); setProjectMenuOpen(false); setNamespaceMenuOpen(false); setSettingsMenuOpen(false); }}>
+      <header className="app-header">
+        <nav className="app-menu" aria-label="Application menu" onPointerDown={(event) => event.stopPropagation()}>
+          <span className="app-logo" aria-hidden="true" />
+          <button type="button" className="app-menu-item">File</button>
+          <button type="button" className="app-menu-item">View</button>
+          <div className="app-menu-popover">
+            <button
+              type="button"
+              className={`app-menu-item ${settingsMenuOpen ? "active" : ""}`}
+              aria-haspopup="menu"
+              aria-expanded={settingsMenuOpen}
+              onClick={() => setSettingsMenuOpen((current) => !current)}
             >
-              <button
-                type="button"
-                className="project-select"
-                onClick={() => {
-                  setActiveProjectId(project.id);
-                  showSlide(project.slides[0]?.id ?? "");
-                }}
-              >
-                <span>{project.name}</span>
-                <small>{project.slides.length} слайд.</small>
-              </button>
-              <button
-                type="button"
-                className="project-delete"
-                title="Удалить проект"
-                aria-label="Удалить проект"
-                onClick={() => deleteProject(project.id)}
-              >
-                ×
+              Settings
+            </button>
+            {settingsMenuOpen && (
+              <div className="settings-menu" role="menu">
+                <label className="settings-toggle" role="menuitemcheckbox" aria-checked={showRevealNumbers}>
+                  <input
+                    type="checkbox"
+                    checked={showRevealNumbers}
+                    onChange={(event) => setShowRevealNumbers(event.target.checked)}
+                  />
+                  <span className="settings-check" aria-hidden="true" />
+                  <span>Show reveal numbers</span>
+                </label>
+                <label className="settings-toggle" role="menuitemcheckbox" aria-checked={showEditGrid}>
+                  <input
+                    type="checkbox"
+                    checked={showEditGrid}
+                    onChange={(event) => setShowEditGrid(event.target.checked)}
+                  />
+                  <span className="settings-check" aria-hidden="true" />
+                  <span>Show edit grid</span>
+                </label>
+                <label className="settings-toggle" role="menuitemcheckbox" aria-checked={showPreviewGrid}>
+                  <input
+                    type="checkbox"
+                    checked={showPreviewGrid}
+                    onChange={(event) => setShowPreviewGrid(event.target.checked)}
+                  />
+                  <span className="settings-check" aria-hidden="true" />
+                  <span>Show preview grid</span>
+                </label>
+              </div>
+            )}
+          </div>
+        </nav>
+        <div className="app-user">
+          <span>demo@reveal.studio</span>
+          <span className="app-user-icon" aria-hidden="true" />
+        </div>
+      </header>
+
+      <div className="studio-shell">
+        <aside className="sidebar">
+        <div className="namespace-switcher" onPointerDown={(event) => event.stopPropagation()}>
+          <button
+            type="button"
+            className={`namespace-trigger ${namespaceMenuOpen ? "open" : ""}`}
+            aria-haspopup="listbox"
+            aria-expanded={namespaceMenuOpen}
+            onClick={() => setNamespaceMenuOpen((current) => !current)}
+          >
+            <span>
+              <strong>{activeNamespace.name}</strong>
+              <small>{projects.length} projects</small>
+            </span>
+            <span className="project-chevron" aria-hidden="true" />
+          </button>
+          {namespaceMenuOpen && (
+            <div className="namespace-menu" role="listbox" aria-label="Namespaces">
+              {namespaces.map((namespace) => (
+                <div
+                  className={`namespace-option ${namespace.id === activeNamespace.id ? "active" : ""} ${renamingNamespaceId === namespace.id ? "renaming" : ""}`}
+                  key={namespace.id}
+                  role="option"
+                  aria-selected={namespace.id === activeNamespace.id}
+                  onContextMenu={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    setNamespaceContextMenu({ x: event.clientX, y: event.clientY, namespaceId: namespace.id });
+                  }}
+                >
+                  {renamingNamespaceId === namespace.id ? (
+                    <input
+                      autoFocus
+                      className="project-rename-input"
+                      value={renamingNamespaceName}
+                      onChange={(event) => setRenamingNamespaceName(event.target.value)}
+                      onBlur={commitNamespaceRename}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") commitNamespaceRename();
+                        if (event.key === "Escape") cancelNamespaceRename();
+                      }}
+                    />
+                  ) : (
+                    <button
+                      type="button"
+                      className="namespace-option-select"
+                      onClick={() => switchNamespace(namespace.id)}
+                    >
+                      <span>{namespace.name}</span>
+                      <small>{namespace.projects.length} projects</small>
+                    </button>
+                  )}
+                </div>
+              ))}
+              <button type="button" className="project-new-option" onClick={addNamespace}>
+                <span aria-hidden="true">+</span>
+                <strong>New namespace</strong>
               </button>
             </div>
-          ))}
+          )}
+        </div>
+        <div className="project-switcher" onPointerDown={(event) => event.stopPropagation()}>
+          <button
+            type="button"
+            className={`project-trigger ${projectMenuOpen ? "open" : ""}`}
+            aria-haspopup="listbox"
+            aria-expanded={projectMenuOpen}
+            onClick={() => setProjectMenuOpen((current) => !current)}
+          >
+            <span>
+              <strong>{activeProject.name}</strong>
+              <small>{activeProject.slides.length} slides</small>
+            </span>
+            <span className="project-chevron" aria-hidden="true" />
+          </button>
+          {projectMenuOpen && (
+            <div className="project-menu" role="listbox" aria-label="Projects">
+              {projects.map((project) => (
+                <div
+                  className={`project-option ${project.id === activeProject.id ? "active" : ""} ${renamingProjectId === project.id ? "renaming" : ""}`}
+                  key={project.id}
+                  role="option"
+                  aria-selected={project.id === activeProject.id}
+                  onContextMenu={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    setProjectContextMenu({ x: event.clientX, y: event.clientY, projectId: project.id });
+                  }}
+                >
+                  {renamingProjectId === project.id ? (
+                    <input
+                      autoFocus
+                      className="project-rename-input"
+                      value={renamingProjectName}
+                      onChange={(event) => setRenamingProjectName(event.target.value)}
+                      onBlur={commitProjectRename}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") commitProjectRename();
+                        if (event.key === "Escape") cancelProjectRename();
+                      }}
+                    />
+                  ) : (
+                    <button
+                      type="button"
+                      className="project-option-select"
+                      onClick={() => {
+                        setActiveProjectId(project.id);
+                        setProjectMenuOpen(false);
+                        setProjectContextMenu(null);
+                        showSlide(project.slides[0]?.id ?? "");
+                      }}
+                    >
+                      <span>{project.name}</span>
+                      <small>{project.slides.length} slides</small>
+                    </button>
+                  )}
+                </div>
+              ))}
+              <button type="button" className="project-new-option" onClick={addProject}>
+                <span aria-hidden="true">+</span>
+                <strong>New project</strong>
+              </button>
+            </div>
+          )}
         </div>
 
-        <label className="field-label">
-          Название проекта
-          <input value={activeProject.name} onChange={(event) => commitProjects((project) => ({ ...project, name: event.target.value }))} />
-        </label>
-
         <div className="panel-section element-palette-section">
-          <h2>Элементы</h2>
+          <h2 className="palette-section-title">Text</h2>
           <div className="element-palette text-palette">
             {toolItems.filter((item) => item.type === "text").map((item) => (
               <button
@@ -3191,11 +5094,34 @@ export default function Home() {
             ))}
           </div>
           <div className="palette-divider" />
+          <h2 className="palette-section-title">Shapes</h2>
           <div className="element-palette shape-palette">
-            {toolItems.filter((item) => item.type !== "text").map((item) => (
+            {toolItems.filter((item) => item.type !== "text" && !["code", "file-tree", "table"].includes(item.type)).map((item) => (
               <button
                 type="button"
                 className="palette-button shape-button"
+                key={`${item.type}-${item.label}`}
+                title={item.label}
+                aria-label={item.label}
+                onClick={() => {
+                  if (item.type === "curved-arrow") {
+                    activatePlacementTool(item.type, item.textPreset);
+                    return;
+                  }
+                  addElement(item.type, item.textPreset);
+                }}
+              >
+                <span className={`tool-icon tool-${item.icon}`} />
+              </button>
+            ))}
+          </div>
+          <div className="palette-divider" />
+          <h2 className="palette-section-title">Rich elements</h2>
+          <div className="element-palette content-palette">
+            {toolItems.filter((item) => ["code", "file-tree", "table"].includes(item.type)).map((item) => (
+              <button
+                type="button"
+                className="palette-button content-button"
                 key={`${item.type}-${item.label}`}
                 title={item.label}
                 aria-label={item.label}
@@ -3207,30 +5133,9 @@ export default function Home() {
           </div>
         </div>
 
-        <div className="slides-header">
-          <h2>Слайды</h2>
-          <button type="button" className="small-button" onClick={addSlide}>
-            Добавить
-          </button>
-        </div>
-
-        <div className="slide-list">
-          {activeProject.slides.map((slide, index) => (
-            <button
-              type="button"
-              key={slide.id}
-              className={`slide-thumb ${slide.id === activeSlide.id ? "active" : ""}`}
-              onClick={() => showSlide(slide.id)}
-            >
-              <span>{index + 1}</span>
-              <strong>{slide.title}</strong>
-              <small>{slide.elements.length} эл.</small>
-            </button>
-          ))}
-        </div>
       </aside>
 
-      <section className="workspace">
+        <section className="workspace">
         <header className="topbar">
           <strong>{activeSlide.title}</strong>
           <div className="toolbar">
@@ -3238,22 +5143,42 @@ export default function Home() {
           </div>
         </header>
 
-        <div className="canvas-wrap">
+        <div
+          className={`canvas-wrap ${isCanvasPanning ? "is-panning" : ""} ${dragState?.mode === "move" ? "is-moving-element" : ""}`}
+          ref={canvasWrapRef}
+          onPointerDownCapture={startCanvasPan}
+          onPointerMove={moveCanvasPan}
+          onPointerUp={stopCanvasPan}
+          onPointerCancel={stopCanvasPan}
+          onAuxClick={preventMiddleMouseAutoscroll}
+          onMouseDown={preventMiddleMouseAutoscroll}
+        >
           <div
-            ref={stageRef}
-            className={`stage ${marqueeSelection ? "is-marquee-selecting" : ""} ${pendingPlacement ? "is-placing-element" : ""}`}
-            style={
-              {
-                backgroundColor: activeSlide.background,
-                "--grid-color": getGridColor(activeSlide.background),
-              } as CSSProperties
-            }
-            onPointerDown={startMarqueeSelection}
-            onPointerMove={updateMarqueeSelection}
-            onPointerUp={stopMarqueeSelection}
-            onPointerCancel={stopMarqueeSelection}
-            onContextMenu={(event) => event.preventDefault()}
+            className="canvas-plane"
+            style={{ height: `${canvasPlaneHeight}px`, width: `${canvasPlaneWidth}px` }}
           >
+            <div
+              className="stage-zoom-frame"
+              style={{ height: `${scaledCanvasHeight}px`, width: `${scaledCanvasWidth}px` }}
+            >
+              <div
+                ref={stageRef}
+                className={`stage ${showEditGrid ? "" : "hide-grid"} ${marqueeSelection ? "is-marquee-selecting" : ""} ${pendingPlacement ? "is-placing-element" : ""}`}
+                style={
+                  {
+                    backgroundColor: activeSlide.background,
+                    backgroundImage: showEditGrid ? undefined : "none",
+                    transform: `scale(${canvasZoom})`,
+                    width: `${canvasBaseWidth}px`,
+                    "--grid-color": getGridColor(activeSlide.background),
+                  } as CSSProperties
+                }
+                onPointerDown={startMarqueeSelection}
+                onPointerMove={updateMarqueeSelection}
+                onPointerUp={stopMarqueeSelection}
+                onPointerCancel={stopMarqueeSelection}
+                onContextMenu={(event) => event.preventDefault()}
+              >
             {alignmentGuides.map((guide, index) => (
               <span
                 aria-hidden="true"
@@ -3270,12 +5195,15 @@ export default function Home() {
             {activeSlide.elements.map((element) => renderRevealBadge(element))}
             {selectedElement && editingTextId !== selectedElement.id && (
               <div
-                className="selection-box single-selection-box"
+                className={`selection-box single-selection-box ${selectedElementIsSmall ? "compact-selection-box" : ""}`}
                 onPointerDown={(event) => startMove(event, selectedElement)}
                 onContextMenu={(event) => handleElementContextMenu(event, selectedElement)}
                 onDoubleClick={(event) => {
+                  event.preventDefault();
                   event.stopPropagation();
-                  if (selectedElement.type === "text" || selectedElement.type === "code") startTextEditing(selectedElement);
+                  if (selectedElement.type === "text" || selectedElement.type === "code") {
+                    startTextEditing(selectedElement, "pointer", { x: event.clientX, y: event.clientY });
+                  }
                 }}
                 style={{
                   left: `${(selectedElement.x / canvasWidth) * 100}%`,
@@ -3285,19 +5213,35 @@ export default function Home() {
                   transform: `rotate(${selectedElement.rotation}deg)`,
                 }}
               >
-                <button className="rotate-handle" type="button" title="Повернуть" onPointerDown={(event) => startRotate(event, selectedElement)} />
+                <button className="rotate-handle" type="button" title="Rotate" onPointerDown={(event) => startRotate(event, selectedElement)} />
+                {dragState?.mode === "rotate" && dragState.elementId === selectedElement.id && (
+                  <span
+                    className="rotation-degree-badge"
+                    style={{ transform: `translateX(-50%) rotate(${-selectedElement.rotation}deg)` }}
+                  >
+                    {formatDegrees(selectedElement.rotation)}°
+                  </span>
+                )}
                 {resizeHandles.map((handle) => (
                   <button
                     className={`resize-handle resize-${handle}`}
                     key={handle}
                     type="button"
-                    title="Изменить размер"
+                    title="Resize"
                     onPointerDown={(event) => startResize(event, selectedElement, handle)}
                   />
                 ))}
               </div>
             )}
-            {pendingPlacementPreview && (
+            {pendingCurvedArrowPreview && (
+              <div
+                aria-hidden="true"
+                className="placement-curved-arrow-preview"
+              >
+                {renderElement(pendingCurvedArrowPreview, false)}
+              </div>
+            )}
+            {pendingPlacementPreview && pendingPlacement?.type !== "curved-arrow" && (
               <div
                 aria-hidden="true"
                 className={`placement-preview placement-preview-${pendingPlacementPreview.type}`}
@@ -3329,85 +5273,114 @@ export default function Home() {
                 }}
               />
             )}
-            {selectionBounds && selectedElements.length > 1 && (
-              <div
-                className="selection-box"
-                onPointerDown={startSelectionMove}
-                onContextMenu={handleSelectionContextMenu}
-                style={{
-                  left: `${(selectionBounds.x / canvasWidth) * 100}%`,
-                  top: `${(selectionBounds.y / canvasHeight) * 100}%`,
-                  width: `${(selectionBounds.width / canvasWidth) * 100}%`,
-                  height: `${(selectionBounds.height / canvasHeight) * 100}%`,
-                }}
-              >
-                <span className="selection-count">{selectedElements.length}</span>
-                {resizeHandles.map((handle) => (
-                  <button
-                    className={`resize-handle resize-${handle}`}
-                    key={handle}
-                    type="button"
-                    title="Изменить размер группы"
-                    onPointerDown={(event) => startGroupResize(event, handle)}
-                  />
-                ))}
+              {selectionBounds && selectedElements.length > 1 && (
+                <div
+                  className={`selection-box ${selectionBoundsIsSmall ? "compact-selection-box" : ""}`}
+                  onPointerDown={startSelectionMove}
+                  onContextMenu={handleSelectionContextMenu}
+                  style={{
+                    left: `${(selectionBounds.x / canvasWidth) * 100}%`,
+                    top: `${(selectionBounds.y / canvasHeight) * 100}%`,
+                    width: `${(selectionBounds.width / canvasWidth) * 100}%`,
+                    height: `${(selectionBounds.height / canvasHeight) * 100}%`,
+                  }}
+                >
+                  <span className="selection-count">{selectedElements.length}</span>
+                  <button className="rotate-handle" type="button" title="Rotate group" onPointerDown={startGroupRotate} />
+                  {dragState?.mode === "group-rotate" && (
+                    <span className="rotation-degree-badge">
+                      {formatDegrees(selectedElements[0]?.rotation ?? 0)}°
+                    </span>
+                  )}
+                  {resizeHandles.map((handle) => (
+                    <button
+                      className={`resize-handle resize-${handle}`}
+                      key={handle}
+                      type="button"
+                      title="Resize group"
+                      onPointerDown={(event) => startGroupResize(event, handle)}
+                    />
+                  ))}
+                </div>
+              )}
               </div>
-            )}
+            </div>
           </div>
         </div>
 
-        <footer className="timeline">
-          <span>Reveal:</span>
-          {revealGroups.map(([step, count]) => (
-            <button
-              type="button"
-              key={step}
-              className={selectedElements.length > 0 && selectedElements.every((element) => element.reveal === step) ? "active" : ""}
-              onClick={() => {
-                if (selectedElements.length === 0) return;
-                selectedElements.forEach((element) => commitElement(element.id, { reveal: step }));
-              }}
-            >
-              {step}<small>{count}</small>
+        <footer className="timeline" aria-label="Slide navigation">
+          <div className="timeline-viewport" ref={slideCarouselRef}>
+            {activeProject.slides.map((slide, index) => (
+              <button
+                type="button"
+                key={slide.id}
+                draggable
+                data-slide-id={slide.id}
+                className={`timeline-slide ${slide.id === activeSlide.id ? "active" : ""} ${slide.id === draggedSlideId ? "dragging" : ""} ${slideDropIndicator?.slideId === slide.id ? `drop-${slideDropIndicator.placement}` : ""}`}
+                onClick={() => showSlide(slide.id)}
+                onContextMenu={(event) => handleSlideContextMenu(event, slide.id)}
+                onDragStart={(event) => handleSlideDragStart(event, slide.id)}
+                onDragOver={(event) => handleSlideDragOver(event, slide.id)}
+                onDragLeave={(event) => {
+                  if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+                  if (slideDropIndicator?.slideId === slide.id) setSlideDropIndicator(null);
+                }}
+                onDrop={(event) => handleSlideDrop(event, slide.id)}
+                onDragEnd={handleSlideDragEnd}
+                onKeyDown={(event) => {
+                  if (event.key !== "Backspace" && event.key !== "Delete") return;
+                  event.preventDefault();
+                  event.stopPropagation();
+                  requestDeleteSlide(slide.id);
+                }}
+                title={slide.title}
+              >
+                <span className="timeline-slide-number">{index + 1}</span>
+                {renderSlidePreview(slide)}
+                <span className="timeline-slide-title">{slide.title}</span>
+              </button>
+            ))}
+            <button type="button" className="timeline-new-slide" onClick={addSlide} aria-label="Add slide">
+              <span aria-hidden="true">+</span>
             </button>
-          ))}
+          </div>
         </footer>
       </section>
 
-      <aside className="inspector">
+        <aside className="inspector">
         <div className="panel-section">
-          <h2>Элемент</h2>
+          <h2>Element</h2>
           {selectedElement ? (
             <div className="inspector-grid">
               {selectedElement.type === "text" && (
                 <>
-                  <label className="field-label wide">Текст<textarea value={selectedElement.text} onChange={(event) => commitElement(selectedElement.id, { text: event.target.value, textHtml: textToHtml(event.target.value), ...estimateTextBounds(event.target.value, selectedElement.fontSize ?? 36, selectedElement.textAutoSize ? undefined : selectedElement.width, selectedElement.fontWeight ?? 800) })} /></label>
+                  <label className="field-label wide">Text<textarea value={getTextElementPlainText(selectedElement)} onChange={(event) => commitElement(selectedElement.id, { text: event.target.value, textHtml: textToHtml(event.target.value), ...estimateTextBounds(event.target.value, selectedElement.fontSize ?? 36, selectedElement.textAutoSize ? undefined : selectedElement.width, selectedElement.fontWeight ?? 800) })} /></label>
                   <div className="field-label wide">
-                    <span>Фрагмент</span>
+                    <span>Selection</span>
                     <div className="text-style-controls">
-                      <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => applyRichTextCommand("bold")}>B</button>
-                      <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => applyRichTextCommand("italic")}><i>I</i></button>
+                      <button type="button" onPointerDown={(event) => runTextStyleControl(event, () => applyRichTextCommand("bold"))}>B</button>
+                      <button type="button" onPointerDown={(event) => runTextStyleControl(event, () => applyRichTextCommand("italic"))}><i>I</i></button>
                       {editingTextId === selectedElement.id && (
                         <>
-                          <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => applySelectedTextFontDelta(-4)}>A-</button>
-                          <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => applySelectedTextFontDelta(4)}>A+</button>
-                          <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => applySelectedTextWeightDelta(-100)}>W-</button>
-                          <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => applySelectedTextWeightDelta(100)}>W+</button>
+                          <button type="button" onPointerDown={(event) => runTextStyleControl(event, () => applySelectedTextFontDelta(-4))}>A-</button>
+                          <button type="button" onPointerDown={(event) => runTextStyleControl(event, () => applySelectedTextFontDelta(4))}>A+</button>
+                          <button type="button" onPointerDown={(event) => runTextStyleControl(event, () => applySelectedTextWeightDelta(-100))}>W-</button>
+                          <button type="button" onPointerDown={(event) => runTextStyleControl(event, () => applySelectedTextWeightDelta(100))}>W+</button>
                         </>
                       )}
                     </div>
                   </div>
-                  <label className="field-label"><span>Размер</span><NumberInput key={`${selectedElement.id}-font-size`} min={8} value={selectedElement.fontSize} onCommit={(value) => {
+                  <label className="field-label"><span>Size</span><TextFontSizeControl key={`${selectedElement.id}-font-size`} value={selectedElement.fontSize} onCommit={(value) => {
                     const fontSize = Math.max(8, value);
-                    commitElement(selectedElement.id, { fontSize, ...estimateTextBounds(selectedElement.text ?? "", fontSize, selectedElement.textAutoSize ? undefined : selectedElement.width, selectedElement.fontWeight ?? 800) });
+                    commitElement(selectedElement.id, { fontSize, ...estimateTextBounds(getTextElementPlainText(selectedElement), fontSize, selectedElement.textAutoSize ? undefined : selectedElement.width, selectedElement.fontWeight ?? 800) });
                   }} /></label>
-                  <label className="field-label"><span>Жирность</span><NumberInput key={`${selectedElement.id}-font-weight`} min={100} max={900} step={50} value={selectedElement.fontWeight ?? 800} onCommit={(value) => {
+                  <label className="field-label"><span>Weight</span><TextFontWeightControl key={`${selectedElement.id}-font-weight`} value={selectedElement.fontWeight ?? 800} onCommit={(value) => {
                     const fontWeight = clamp(value, 100, 900);
-                    commitElement(selectedElement.id, { fontWeight, ...estimateTextBounds(selectedElement.text ?? "", selectedElement.fontSize ?? 36, selectedElement.textAutoSize ? undefined : selectedElement.width, fontWeight) });
+                    commitElement(selectedElement.id, { fontWeight, ...estimateTextBounds(getTextElementPlainText(selectedElement), selectedElement.fontSize ?? 36, selectedElement.textAutoSize ? undefined : selectedElement.width, fontWeight) });
                   }} /></label>
-                  <label className="field-label compact-field">Цвет<ColorInput label="Цвет текста" value={selectedElement.fill} onChange={(fill) => commitElement(selectedElement.id, { fill })} /></label>
+                  <label className="field-label compact-field">Color<ColorInput label="Text color" value={selectedElement.fill} onChange={(fill) => commitElement(selectedElement.id, { fill })} /></label>
                   <div className="field-label wide">
-                    <span>Выравнивание</span>
+                    <span>Alignment</span>
                     <div className="segmented-control">
                       <button type="button" className={(selectedElement.textAlign ?? "left") === "left" ? "active" : ""} onClick={() => commitElement(selectedElement.id, { textAlign: "left" })}>Start</button>
                       <button type="button" className={selectedElement.textAlign === "center" ? "active" : ""} onClick={() => commitElement(selectedElement.id, { textAlign: "center" })}>Center</button>
@@ -3419,7 +5392,7 @@ export default function Home() {
               {selectedElement.type === "code" && (
                 <>
                   <label className="field-label wide">
-                    Код
+                    Code
                     <textarea
                       className="code-textarea"
                       placeholder={isShellLanguage(selectedElement.language) ? "~/robot_ws$ colcon build\n~/robot_ws/src$ ros2 pkg create robot_description" : undefined}
@@ -3428,10 +5401,10 @@ export default function Home() {
                       onChange={(event) => commitElement(selectedElement.id, { text: event.target.value })}
                       onKeyDown={handleIndentTextareaKeyDown}
                     />
-                    {isShellLanguage(selectedElement.language) && <span className="field-hint">Для bash можно писать как в терминале: директория$ команда</span>}
+                    {isShellLanguage(selectedElement.language) && <span className="field-hint">For bash, you can write terminal-style lines: directory$ command</span>}
                   </label>
                   <label className="field-label wide">
-                    Язык
+                    Language
                     <select
                       value={selectedElement.language ?? "javascript"}
                       onChange={(event) => commitElement(selectedElement.id, { language: event.target.value })}
@@ -3442,7 +5415,7 @@ export default function Home() {
                     </select>
                   </label>
                   <label className="field-label">
-                    <span>Размер</span>
+                    <span>Size</span>
                     <NumberInput
                       key={`${selectedElement.id}-code-font-size`}
                       min={8}
@@ -3451,10 +5424,10 @@ export default function Home() {
                       onCommit={(fontSize) => commitElement(selectedElement.id, { fontSize })}
                     />
                   </label>
-                  <label className="field-label compact-field">Фон<ColorInput label="Фон кода" value={selectedElement.fill} onChange={(fill) => commitElement(selectedElement.id, { fill })} /></label>
-                  <label className="field-label compact-field">Рамка<ColorInput label="Цвет рамки кода" value={selectedElement.stroke} onChange={(stroke) => commitElement(selectedElement.id, { stroke })} /></label>
+                  <label className="field-label compact-field">Background<ColorInput label="Code background" value={selectedElement.fill} onChange={(fill) => commitElement(selectedElement.id, { fill })} /></label>
+                  <label className="field-label compact-field">Border<ColorInput label="Code border color" value={selectedElement.stroke} onChange={(stroke) => commitElement(selectedElement.id, { stroke })} /></label>
                   <label className="field-label">
-                    <span>Скругление</span>
+                    <span>Radius</span>
                     <NumberInput key={`${selectedElement.id}-code-radius`} min={0} value={selectedElement.radius ?? 8} onCommit={(radius) => commitElement(selectedElement.id, { radius: Math.max(0, radius) })} />
                   </label>
                 </>
@@ -3462,7 +5435,7 @@ export default function Home() {
               {selectedElement.type === "file-tree" && (
                 <>
                   <label className="field-label wide">
-                    Структура
+                    Structure
                     <textarea
                       className="code-textarea"
                       spellCheck={false}
@@ -3472,7 +5445,7 @@ export default function Home() {
                     />
                   </label>
                   <label className="field-label">
-                    <span>Размер</span>
+                    <span>Size</span>
                     <NumberInput
                       key={`${selectedElement.id}-tree-font-size`}
                       min={8}
@@ -3481,37 +5454,87 @@ export default function Home() {
                       onCommit={(fontSize) => commitElement(selectedElement.id, { fontSize })}
                     />
                   </label>
-                  <label className="field-label compact-field">Фон<ColorInput label="Фон структуры" value={selectedElement.fill} onChange={(fill) => commitElement(selectedElement.id, { fill })} /></label>
-                  <label className="field-label compact-field">Текст<ColorInput label="Цвет структуры" value={selectedElement.stroke} onChange={(stroke) => commitElement(selectedElement.id, { stroke })} /></label>
+                  <label className="field-label compact-field">Background<ColorInput label="Structure background" value={selectedElement.fill} onChange={(fill) => commitElement(selectedElement.id, { fill })} /></label>
+                  <label className="field-label compact-field">Text<ColorInput label="Structure text color" value={selectedElement.stroke} onChange={(stroke) => commitElement(selectedElement.id, { stroke })} /></label>
                   <label className="field-label">
-                    <span>Скругление</span>
+                    <span>Radius</span>
                     <NumberInput key={`${selectedElement.id}-tree-radius`} min={0} value={selectedElement.radius ?? 8} onCommit={(radius) => commitElement(selectedElement.id, { radius: Math.max(0, radius) })} />
                   </label>
                 </>
               )}
+              {selectedElement.type === "table" && (
+                <>
+                  <label className="field-label wide">
+                    Table data
+                    <textarea
+                      className="code-textarea"
+                      spellCheck={false}
+                      value={selectedElement.text ?? ""}
+                      onChange={(event) => commitElement(selectedElement.id, { text: event.target.value })}
+                      onKeyDown={handleIndentTextareaKeyDown}
+                    />
+                    <span className="field-hint">Use tabs or commas to separate columns. First row is styled as the header.</span>
+                  </label>
+                  <label className="field-label">
+                    <span>Size</span>
+                    <NumberInput
+                      key={`${selectedElement.id}-table-font-size`}
+                      min={8}
+                      max={48}
+                      value={selectedElement.fontSize ?? 18}
+                      onCommit={(fontSize) => commitElement(selectedElement.id, { fontSize })}
+                    />
+                  </label>
+                  <label className="field-label compact-field">Background<ColorInput label="Table background" value={selectedElement.fill} onChange={(fill) => commitElement(selectedElement.id, { fill })} /></label>
+                  <label className="field-label compact-field">Text<ColorInput label="Table text color" value={selectedElement.stroke} onChange={(stroke) => commitElement(selectedElement.id, { stroke })} /></label>
+                  <label className="field-label">
+                    <span>Radius</span>
+                    <NumberInput key={`${selectedElement.id}-table-radius`} min={0} value={selectedElement.radius ?? 8} onCommit={(radius) => commitElement(selectedElement.id, { radius: Math.max(0, radius) })} />
+                  </label>
+                </>
+              )}
               {!selectedHasStrokeControls && (
-                selectedElement.type !== "text" && selectedElement.type !== "code" && selectedElement.type !== "file-tree" && (
+                selectedElement.type !== "text" && selectedElement.type !== "code" && selectedElement.type !== "file-tree" && selectedElement.type !== "table" && (
                   <>
-                    <label className="field-label compact-field">Заливка<ColorInput label="Цвет заливки" value={selectedElement.fill} onChange={(fill) => commitElement(selectedElement.id, { fill })} /></label>
-                    {["rect", "diamond", "triangle", "circle"].includes(selectedElement.type) && (
-                      <label className="field-label compact-field">Контур<ColorInput label="Цвет контура" value={selectedElement.stroke} onChange={(stroke) => commitElement(selectedElement.id, { stroke })} /></label>
+                    <label className="field-label compact-field">Fill<ColorInput label="Fill color" value={selectedElement.fill} onChange={(fill) => commitElement(selectedElement.id, { fill })} /></label>
+                    {["rect", "diamond", "triangle", "circle", "cube", "sphere", "cylinder"].includes(selectedElement.type) && (
+                      <label className="field-label compact-field">Stroke<ColorInput label="Stroke color" value={selectedElement.stroke} onChange={(stroke) => commitElement(selectedElement.id, { stroke })} /></label>
                     )}
                     {selectedElement.type === "rect" && (
-                      <label className="field-label"><span>Скругление</span><NumberInput key={`${selectedElement.id}-radius`} min={0} value={selectedElement.radius ?? 0} onCommit={(value) => commitElement(selectedElement.id, { radius: Math.max(0, value) })} /></label>
+                      <label className="field-label"><span>Radius</span><NumberInput key={`${selectedElement.id}-radius`} min={0} value={selectedElement.radius ?? 0} onCommit={(value) => commitElement(selectedElement.id, { radius: Math.max(0, value) })} /></label>
+                    )}
+                    {isThreeShapeType(selectedElement.type) && (
+                      <>
+                        <label className="field-label"><span>Pitch</span><NumberInput key={`${selectedElement.id}-pitch`} min={-180} max={180} value={selectedElement.pitch ?? defaultThreeAngles.pitch} onCommit={(pitch) => commitElement(selectedElement.id, { pitch })} /></label>
+                        <label className="field-label"><span>Yaw</span><NumberInput key={`${selectedElement.id}-yaw`} min={-180} max={180} value={selectedElement.yaw ?? defaultThreeAngles.yaw} onCommit={(yaw) => commitElement(selectedElement.id, { yaw })} /></label>
+                        <label className="field-label"><span>Roll</span><NumberInput key={`${selectedElement.id}-roll`} min={-180} max={180} value={selectedElement.roll ?? defaultThreeAngles.roll} onCommit={(roll) => commitElement(selectedElement.id, { roll })} /></label>
+                      </>
                     )}
                   </>
                 )
               )}
               {selectedHasStrokeControls && (
                 <>
-                  <label className="field-label compact-field">Цвет<ColorInput label="Цвет линии" value={selectedElement.stroke} onChange={(stroke) => commitElement(selectedElement.id, { stroke })} /></label>
-                  <label className="field-label"><span>Толщина</span><NumberInput key={`${selectedElement.id}-stroke-width`} min={0} value={selectedElement.strokeWidth} onCommit={(value) => commitElement(selectedElement.id, { strokeWidth: Math.max(0, value) })} /></label>
+                  {selectedSupportsOptionalFill && (
+                    <div className="field-label wide">
+                      <span>Fill</span>
+                      <div className="segmented-control two-options">
+                        <button type="button" className={!selectedHasFill ? "active" : ""} onClick={() => commitElement(selectedElement.id, { fill: "transparent" })}>None</button>
+                        <button type="button" className={selectedHasFill ? "active" : ""} onClick={() => commitElement(selectedElement.id, { fill: selectedHasFill ? selectedElement.fill : "#ffffff" })}>On</button>
+                      </div>
+                    </div>
+                  )}
+                  {selectedSupportsOptionalFill && selectedHasFill && (
+                    <label className="field-label compact-field">Fill color<ColorInput label="Fill color" value={selectedElement.fill} onChange={(fill) => commitElement(selectedElement.id, { fill })} /></label>
+                  )}
+                  <label className="field-label compact-field">Color<ColorInput label="Line color" value={selectedElement.stroke} onChange={(stroke) => commitElement(selectedElement.id, { stroke })} /></label>
+                  <label className="field-label"><span>Width</span><NumberInput key={`${selectedElement.id}-stroke-width`} min={0} value={selectedElement.strokeWidth} onCommit={(value) => commitElement(selectedElement.id, { strokeWidth: Math.max(0, value) })} /></label>
                 </>
               )}
               <label className="field-label wide">
-                Анимация появления
+                Reveal animation
                 <select value={selectedElement.animation} onChange={(event) => commitElement(selectedElement.id, { animation: event.target.value as RevealAnimation })}>
-                  <option value="none">Без анимации</option>
+                  <option value="none">No animation</option>
                   <option value="fade">Fade in</option>
                   <option value="fade-out">Fade out</option>
                   <option value="fade-up">Fade up</option>
@@ -3522,20 +5545,20 @@ export default function Home() {
             </div>
           ) : selectedElements.length > 1 ? (
             <div className="inspector-grid">
-              <p className="empty-state wide">Выбрано элементов: {selectedElements.length}. Цвет и текст меняются после выбора одного элемента.</p>
+              <p className="empty-state wide">Selected elements: {selectedElements.length}. Color and text controls are available after selecting one element.</p>
             </div>
           ) : (
             <div className="inspector-grid">
               <label className="field-label wide">
-                Название слайда
+                Slide title
                 <input value={activeSlide.title} onChange={(event) => commitSlide((slide) => ({ ...slide, title: event.target.value }))} />
               </label>
               <label className="field-label compact-field">
-                Фон слайда
-                <ColorInput label="Фон слайда" value={activeSlide.background} onChange={(background) => commitSlide((slide) => ({ ...slide, background }))} />
+                Slide background
+                <ColorInput label="Slide background" value={activeSlide.background} onChange={(background) => commitSlide((slide) => ({ ...slide, background }))} />
               </label>
               <label className="field-label wide">
-                Анимация слайда
+                Slide transition
                 <select value={activeSlide.transition} onChange={(event) => commitSlide((slide) => ({ ...slide, transition: event.target.value as SlideTransition }))}>
                   <option value="none">No animation</option>
                   <option value="fade">Fade</option>
@@ -3546,7 +5569,162 @@ export default function Home() {
             </div>
           )}
         </div>
-      </aside>
+        </aside>
+      </div>
+
+      {namespaceContextMenu && (
+        <div
+          className="context-menu namespace-context-menu"
+          style={{ left: namespaceContextMenu.x, top: namespaceContextMenu.y }}
+          onPointerDown={(event) => event.stopPropagation()}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          <button
+            type="button"
+            onClick={() => {
+              const namespace = namespaces.find((item) => item.id === namespaceContextMenu.namespaceId);
+              if (namespace) startRenameNamespace(namespace);
+            }}
+          >
+            Rename
+          </button>
+          <button
+            type="button"
+            className="danger-menu-item"
+            onClick={() => requestDeleteNamespace(namespaceContextMenu.namespaceId)}
+          >
+            Delete
+          </button>
+        </div>
+      )}
+
+      {namespaceDeleteCandidate && (
+        <div className="modal-backdrop" role="presentation" onPointerDown={() => setNamespaceDeleteCandidateId("")}>
+          <div
+            className="confirm-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="delete-namespace-title"
+            onPointerDown={(event) => event.stopPropagation()}
+          >
+            <h2 id="delete-namespace-title">Delete this namespace?</h2>
+            <p>This will delete &quot;{namespaceDeleteCandidate.name}&quot; and its projects. You can undo the action with Ctrl+Z.</p>
+            <div className="confirm-actions">
+              <button type="button" className="small-button" onClick={() => setNamespaceDeleteCandidateId("")}>
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="danger-confirm-button"
+                onClick={() => deleteNamespace(namespaceDeleteCandidate.id)}
+              >
+                Delete namespace
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {projectContextMenu && (
+        <div
+          className="context-menu project-context-menu"
+          style={{ left: projectContextMenu.x, top: projectContextMenu.y }}
+          onPointerDown={(event) => event.stopPropagation()}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          <button
+            type="button"
+            onClick={() => {
+              const project = projects.find((item) => item.id === projectContextMenu.projectId);
+              if (project) startRenameProject(project);
+            }}
+          >
+            Rename
+          </button>
+          <button
+            type="button"
+            className="danger-menu-item"
+            onClick={() => requestDeleteProject(projectContextMenu.projectId)}
+          >
+            Delete
+          </button>
+        </div>
+      )}
+
+      {projectDeleteCandidate && (
+        <div className="modal-backdrop" role="presentation" onPointerDown={() => setProjectDeleteCandidateId("")}>
+          <div
+            className="confirm-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="delete-project-title"
+            onPointerDown={(event) => event.stopPropagation()}
+          >
+            <h2 id="delete-project-title">Delete this project?</h2>
+            <p>This will permanently delete &quot;{projectDeleteCandidate.name}&quot; and all of its slides. You can undo the action with Ctrl+Z.</p>
+            <div className="confirm-actions">
+              <button type="button" className="small-button" onClick={() => setProjectDeleteCandidateId("")}>
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="danger-confirm-button"
+                onClick={() => deleteProject(projectDeleteCandidate.id)}
+              >
+                Delete project
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {slideContextMenu && (
+        <div
+          className="context-menu slide-context-menu"
+          style={{ left: slideContextMenu.x, top: slideContextMenu.y }}
+          onPointerDown={(event) => event.stopPropagation()}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          <button
+            type="button"
+            className="danger-menu-item"
+            disabled={activeProject.slides.length <= 1}
+            onClick={() => requestDeleteSlide(slideContextMenu.slideId)}
+          >
+            Delete
+          </button>
+        </div>
+      )}
+
+      {slideDeleteCandidate && (
+        <div className="modal-backdrop" role="presentation" onPointerDown={() => setSlideDeleteCandidateId("")}>
+          <div
+            className="confirm-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="delete-slide-title"
+            onPointerDown={(event) => event.stopPropagation()}
+          >
+            <h2 id="delete-slide-title">Delete this slide?</h2>
+            <p>This will permanently delete &quot;{slideDeleteCandidate.title}&quot;. You can undo the action with Ctrl+Z.</p>
+            <div className="confirm-actions">
+              <button type="button" className="small-button" onClick={() => setSlideDeleteCandidateId("")}>
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="danger-confirm-button"
+                onClick={() => {
+                  deleteSlide(slideDeleteCandidate.id);
+                  setSlideDeleteCandidateId("");
+                }}
+              >
+                Delete slide
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {contextMenu && (
         <div
@@ -3556,11 +5734,10 @@ export default function Home() {
           onContextMenu={(event) => event.preventDefault()}
         >
           <button type="button" onClick={() => { deleteElement(); setContextMenu(null); setContextSubmenu(null); }}>Delete</button>
-          {canGroupContextTargets && (
-            <button type="button" onClick={groupContextElements}>Group elements</button>
-          )}
-          {canUngroupContextTargets && (
+          {canUngroupContextTargets ? (
             <button type="button" onClick={ungroupContextElements}>Ungroup elements</button>
+          ) : canGroupContextTargets && (
+            <button type="button" onClick={groupContextElements}>Group elements</button>
           )}
           <div className={`context-submenu ${contextSubmenu === "z-index" ? "open" : ""}`} onPointerEnter={() => setContextSubmenu("z-index")}>
             <button type="button" className="context-parent" onFocus={() => setContextSubmenu("z-index")}>Z-index</button>
@@ -3597,10 +5774,11 @@ export default function Home() {
         <div className="presenter" onClick={presentNext}>
           <div
             key={activeSlide.id}
-            className={`present-stage slide-${activeSlide.transition}`}
+            className={`present-stage slide-${activeSlide.transition} ${showPreviewGrid ? "" : "hide-grid"}`}
             style={
               {
                 backgroundColor: activeSlide.background,
+                backgroundImage: showPreviewGrid ? undefined : "none",
                 "--grid-color": getGridColor(activeSlide.background),
               } as CSSProperties
             }
@@ -3610,9 +5788,9 @@ export default function Home() {
               .map((element) => renderElement(element, false, presentReveal))}
           </div>
           <div className="present-controls" onClick={(event) => event.stopPropagation()}>
-            <button type="button" onClick={presentPrev}>Назад</button>
+            <button type="button" onClick={presentPrev}>Back</button>
             <span>{activeSlideIndex + 1}.{presentReveal} / {activeProject.slides.length}.{maxReveal}</span>
-            <button type="button" onClick={() => setPresenting(false)}>Выйти</button>
+            <button type="button" onClick={() => setPresenting(false)}>Exit</button>
           </div>
         </div>
       )}
